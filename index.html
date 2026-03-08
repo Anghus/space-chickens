@@ -1,0 +1,2392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Space Chickens</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+  }
+  canvas { display: block; image-rendering: auto; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ─── Setup ───────────────────────────────────────────────────────────
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 480, H = 640;
+canvas.width = W; canvas.height = H;
+
+// Scale canvas to fit window
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── Audio ───────────────────────────────────────────────────────────
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+// ── Load real sound samples ──
+const samples = {}; // { name: AudioBuffer }
+const sampleFiles = {
+  chicken: 'sounds/chicken.wav',  // farm chickens clucking (~4.3s)
+  hen: 'sounds/hen.wav',          // single hen cluck (~1.3s)
+  rooster: 'sounds/rooster.wav',  // cock-a-doodle-doo (~2s)
+  hawk: 'sounds/hawk.wav',        // hawk screech (~2.4s)
+  donkey: 'sounds/donkey.wav'     // donkey bray (~9s)
+};
+let samplesLoaded = false;
+
+async function loadSamples() {
+  const entries = Object.entries(sampleFiles);
+  await Promise.all(entries.map(async ([name, url]) => {
+    try {
+      const resp = await fetch(url);
+      const arrayBuf = await resp.arrayBuffer();
+      samples[name] = await audioCtx.decodeAudioData(arrayBuf);
+    } catch (e) {
+      console.warn('Could not load sample:', name, e);
+    }
+  }));
+  samplesLoaded = Object.keys(samples).length > 0;
+  console.log('Samples loaded:', Object.keys(samples).join(', '));
+}
+loadSamples();
+
+// Play a loaded sample with options
+function playSample(name, opts = {}) {
+  const buf = samples[name];
+  if (!buf) return;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  // Gain control
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(opts.volume || 1.0, audioCtx.currentTime);
+  src.connect(gain);
+  gain.connect(audioCtx.destination);
+  // Playback rate (pitch shift)
+  src.playbackRate.value = opts.rate || 1.0;
+  // Play from offset, for a given duration (or full clip)
+  const offset = opts.offset || 0;
+  const duration = opts.duration || (buf.duration - offset);
+  src.start(audioCtx.currentTime + (opts.delay || 0), offset, duration);
+  return src;
+}
+
+function makeOsc(type, freq, startT, endT, vol) {
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.connect(g); g.connect(audioCtx.destination);
+  o.type = type;
+  o.frequency.setValueAtTime(freq, startT);
+  g.gain.setValueAtTime(vol, startT);
+  g.gain.exponentialRampToValueAtTime(0.001, endT);
+  o.start(startT); o.stop(endT);
+  return { osc: o, gain: g };
+}
+
+// Pre-create noise buffer for breathy/raspy chicken quality
+const noiseBuffer = (() => {
+  const len = audioCtx.sampleRate * 2;
+  const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  return buf;
+})();
+
+// Realistic chicken voice: sawtooth through formant filters + filtered noise + AM warble
+// opts: pitchStart, pitchEnd, pitchPeak (mult), amRate (Hz), amDepth, noiseVol
+function cluckVoice(freq, startT, dur, vol, opts = {}) {
+  const end = startT + dur;
+  // ── Master gain with fast-attack envelope ──
+  const master = audioCtx.createGain();
+  master.connect(audioCtx.destination);
+  const atk = Math.min(dur * 0.08, 0.006);
+  master.gain.setValueAtTime(0.001, startT);
+  master.gain.linearRampToValueAtTime(vol, startT + atk);
+  master.gain.setValueAtTime(vol * 0.8, startT + dur * 0.12);
+  master.gain.exponentialRampToValueAtTime(0.001, end);
+  // ── LFO amplitude modulation → gargle/warble character ──
+  const lfo = audioCtx.createOscillator();
+  lfo.frequency.setValueAtTime(opts.amRate || 38, startT);
+  const lfoAmp = audioCtx.createGain();
+  lfoAmp.gain.setValueAtTime(vol * (opts.amDepth || 0.3), startT);
+  lfo.connect(lfoAmp);
+  lfoAmp.connect(master.gain);
+  lfo.start(startT); lfo.stop(end + 0.02);
+  // ── Tonal: sawtooth → formant bandpass → nasal peaking ──
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sawtooth';
+  const pS = freq * (opts.pitchStart || 1.2);
+  const pE = freq * (opts.pitchEnd || 0.9);
+  osc.frequency.setValueAtTime(pS, startT);
+  if (opts.pitchPeak) {
+    osc.frequency.exponentialRampToValueAtTime(freq * opts.pitchPeak, startT + dur * 0.18);
+    osc.frequency.exponentialRampToValueAtTime(pE, end);
+  } else {
+    osc.frequency.exponentialRampToValueAtTime(pE, startT + dur * 0.6);
+  }
+  const f1 = audioCtx.createBiquadFilter(); // throat resonance
+  f1.type = 'bandpass';
+  f1.frequency.setValueAtTime(freq * 2, startT);
+  f1.Q.setValueAtTime(4, startT);
+  const f2 = audioCtx.createBiquadFilter(); // nasal resonance
+  f2.type = 'peaking';
+  f2.frequency.setValueAtTime(freq * 4.5, startT);
+  f2.gain.setValueAtTime(8, startT);
+  f2.Q.setValueAtTime(2, startT);
+  const oscGain = audioCtx.createGain();
+  oscGain.gain.setValueAtTime(0.55, startT);
+  osc.connect(f1); f1.connect(f2); f2.connect(oscGain); oscGain.connect(master);
+  osc.start(startT); osc.stop(end + 0.02);
+  // ── Noise: breathiness / rasp ──
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = noiseBuffer;
+  const nFilt = audioCtx.createBiquadFilter();
+  nFilt.type = 'bandpass';
+  nFilt.frequency.setValueAtTime(freq * 3.5, startT);
+  nFilt.Q.setValueAtTime(1.5, startT);
+  const nGain = audioCtx.createGain();
+  nGain.gain.setValueAtTime(opts.noiseVol || 0.35, startT);
+  nGain.gain.exponentialRampToValueAtTime(0.001, end);
+  noise.connect(nFilt); nFilt.connect(nGain); nGain.connect(master);
+  noise.start(startT); noise.stop(end + 0.02);
+  return { osc, master };
+}
+
+function playSound(type) {
+  const t = audioCtx.currentTime;
+
+  if (type === 'shoot') {
+    // Water spray sound (keep synthesized)
+    const o = makeOsc('sawtooth', 3000, t, t + 0.08, 0.12);
+    o.osc.frequency.exponentialRampToValueAtTime(1500, t + 0.08);
+    makeOsc('triangle', 4000, t, t + 0.06, 0.06);
+  } else if (type === 'explode') {
+    // Dying squawk — real hen clip pitched up + sped up for alarm
+    if (samples.hen) {
+      playSample('hen', { rate: 1.2 + Math.random() * 0.5, volume: 0.7, offset: 0, duration: 0.6 });
+    } else {
+      cluckVoice(650, t, 0.12, 0.5, { pitchStart: 0.85, pitchPeak: 1.6, pitchEnd: 0.4, amRate: 55, amDepth: 0.5, noiseVol: 0.5 });
+      cluckVoice(350, t + 0.1, 0.3, 0.4, { pitchStart: 1.0, pitchEnd: 0.25, amRate: 30, amDepth: 0.6, noiseVol: 0.6 });
+    }
+  } else if (type === 'enemyShoot') {
+    // Quick cluck when laying egg — short snip from hen at random pitch
+    if (samples.hen) {
+      playSample('hen', { rate: 0.9 + Math.random() * 0.3, volume: 0.4, offset: 0.1, duration: 0.25 });
+    } else {
+      cluckVoice(420, t, 0.06, 0.3, { pitchStart: 1.2, pitchEnd: 0.88, amRate: 42, noiseVol: 0.25 });
+      cluckVoice(580, t + 0.06, 0.13, 0.35, { pitchStart: 0.8, pitchPeak: 1.45, pitchEnd: 0.55, amRate: 38, amDepth: 0.4, noiseVol: 0.4 });
+    }
+  } else if (type === 'dive') {
+    // Angry clucking — full chicken clip at random offset for variety
+    if (samples.chicken) {
+      const maxOff = Math.max(0, samples.chicken.duration - 1.5);
+      playSample('chicken', { rate: 1.1 + Math.random() * 0.4, volume: 0.6, offset: Math.random() * maxOff, duration: 1.2 });
+    } else {
+      cluckVoice(380, t, 0.06, 0.28, { pitchStart: 1.18, pitchEnd: 0.92 });
+      cluckVoice(430, t + 0.09, 0.06, 0.32, { pitchStart: 1.18, pitchEnd: 0.92 });
+      cluckVoice(480, t + 0.18, 0.06, 0.36, { pitchStart: 1.18, pitchEnd: 0.92, amRate: 42 });
+      cluckVoice(680, t + 0.27, 0.28, 0.5, { pitchStart: 0.75, pitchPeak: 1.55, pitchEnd: 0.45, amRate: 50, amDepth: 0.5, noiseVol: 0.5 });
+    }
+  } else if (type === 'cluck') {
+    // Ambient cluck — random snippet from chicken or hen samples
+    if (samples.chicken) {
+      const r = Math.random();
+      if (r < 0.6) {
+        // Short snippet from the farm chickens
+        const maxOff = Math.max(0, samples.chicken.duration - 0.8);
+        playSample('chicken', { rate: 0.85 + Math.random() * 0.4, volume: 0.3 + Math.random() * 0.15, offset: Math.random() * maxOff, duration: 0.4 + Math.random() * 0.5 });
+      } else if (samples.hen) {
+        // Quick hen cluck
+        playSample('hen', { rate: 0.8 + Math.random() * 0.5, volume: 0.3 + Math.random() * 0.1, offset: 0, duration: 0.5 + Math.random() * 0.5 });
+      }
+    } else {
+      const pitch = 320 + Math.random() * 220;
+      const v = 0.22 + Math.random() * 0.13;
+      cluckVoice(pitch, t, 0.07, v, { pitchStart: 1.22, pitchEnd: 0.82 });
+    }
+  } else if (type === 'playerDeath') {
+    // Keep synthesized (not a chicken sound)
+    const o = makeOsc('sawtooth', 400, t, t + 0.6, 0.3);
+    o.osc.frequency.exponentialRampToValueAtTime(30, t + 0.6);
+    makeOsc('triangle', 300, t, t + 0.5, 0.15);
+  } else if (type === 'stageStart') {
+    // Keep synthesized fanfare
+    makeOsc('square', 523, t, t + 0.2, 0.15);
+    makeOsc('square', 659, t + 0.15, t + 0.35, 0.15);
+    makeOsc('square', 784, t + 0.3, t + 0.6, 0.15);
+  } else if (type === 'hawkScreech') {
+    // Real hawk screech
+    if (samples.hawk) {
+      playSample('hawk', { rate: 1.0 + Math.random() * 0.2, volume: 0.6 });
+    } else {
+      cluckVoice(900, t, 0.25, 0.45, { pitchStart: 1.3, pitchPeak: 1.5, pitchEnd: 0.5, amRate: 18, amDepth: 0.35, noiseVol: 0.55 });
+      cluckVoice(750, t + 0.15, 0.35, 0.3, { pitchStart: 1.1, pitchEnd: 0.35, amRate: 12, amDepth: 0.4, noiseVol: 0.6 });
+    }
+  } else if (type === 'hawkDeath') {
+    // Hawk dying: sped-up screech
+    if (samples.hawk) {
+      playSample('hawk', { rate: 1.5, volume: 0.8, duration: 1.0 });
+    } else {
+      cluckVoice(1100, t, 0.15, 0.55, { pitchStart: 1.4, pitchEnd: 0.3, amRate: 60, amDepth: 0.6, noiseVol: 0.7 });
+      cluckVoice(500, t + 0.08, 0.4, 0.4, { pitchStart: 0.8, pitchEnd: 0.15, amRate: 25, amDepth: 0.7, noiseVol: 0.8 });
+    }
+  }
+}
+
+// Rooster crow: "cock-a-doodle-doo!" — multi-syllable with vibrato sustain
+function playCrowSound() {
+  // Use real rooster sample if loaded
+  if (samples.rooster) {
+    playSample('rooster', { rate: 1.0, volume: 0.8 });
+    return;
+  }
+  // ── Synthesized fallback ──
+  const t = audioCtx.currentTime + 0.05;
+  function crowNote(freq, start, dur, vol, opts = {}) {
+    const end = start + dur;
+    const master = audioCtx.createGain();
+    master.connect(audioCtx.destination);
+    const atk = Math.min(dur * 0.12, 0.015);
+    master.gain.setValueAtTime(0.001, start);
+    master.gain.linearRampToValueAtTime(vol, start + atk);
+    if (opts.sustain) {
+      master.gain.setValueAtTime(vol * 0.85, start + dur * 0.15);
+      master.gain.setValueAtTime(vol * 0.7, start + dur * 0.6);
+      master.gain.exponentialRampToValueAtTime(0.001, end);
+    } else {
+      master.gain.setValueAtTime(vol * 0.75, start + dur * 0.2);
+      master.gain.exponentialRampToValueAtTime(0.001, end);
+    }
+    const lfo = audioCtx.createOscillator();
+    lfo.frequency.setValueAtTime(opts.vibRate || 6, start);
+    const lfoGain = audioCtx.createGain();
+    lfoGain.gain.setValueAtTime(opts.vibDepth || 18, start);
+    lfo.connect(lfoGain);
+    const amLfo = audioCtx.createOscillator();
+    amLfo.frequency.setValueAtTime(opts.amRate || 32, start);
+    const amGain = audioCtx.createGain();
+    amGain.gain.setValueAtTime(vol * (opts.amDepth || 0.15), start);
+    amLfo.connect(amGain);
+    amGain.connect(master.gain);
+    amLfo.start(start); amLfo.stop(end + 0.02);
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(freq * (opts.pitchStart || 1.0), start);
+    lfoGain.connect(osc.frequency);
+    lfo.start(start); lfo.stop(end + 0.02);
+    if (opts.pitchPeak) {
+      osc.frequency.exponentialRampToValueAtTime(freq * opts.pitchPeak, start + dur * (opts.peakTime || 0.2));
+      osc.frequency.exponentialRampToValueAtTime(freq * (opts.pitchEnd || 0.85), end);
+    } else {
+      osc.frequency.exponentialRampToValueAtTime(freq * (opts.pitchEnd || 0.85), end);
+    }
+    const f1 = audioCtx.createBiquadFilter();
+    f1.type = 'bandpass';
+    f1.frequency.setValueAtTime(freq * 2.2, start);
+    f1.Q.setValueAtTime(3, start);
+    const f2 = audioCtx.createBiquadFilter();
+    f2.type = 'peaking';
+    f2.frequency.setValueAtTime(freq * 5, start);
+    f2.gain.setValueAtTime(10, start);
+    f2.Q.setValueAtTime(1.8, start);
+    const oscGain = audioCtx.createGain();
+    oscGain.gain.setValueAtTime(0.5, start);
+    osc.connect(f1); f1.connect(f2); f2.connect(oscGain); oscGain.connect(master);
+    osc.start(start); osc.stop(end + 0.02);
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = noiseBuffer;
+    const nFilt = audioCtx.createBiquadFilter();
+    nFilt.type = 'bandpass';
+    nFilt.frequency.setValueAtTime(freq * 3.5, start);
+    nFilt.Q.setValueAtTime(1.2, start);
+    const nGain = audioCtx.createGain();
+    nGain.gain.setValueAtTime(opts.noiseVol || 0.2, start);
+    nGain.gain.exponentialRampToValueAtTime(0.001, end);
+    noise.connect(nFilt); nFilt.connect(nGain); nGain.connect(master);
+    noise.start(start); noise.stop(end + 0.02);
+  }
+  const base = 520;
+  crowNote(base, t, 0.22, 0.45, {
+    pitchStart: 0.7, pitchPeak: 1.4, pitchEnd: 1.2, peakTime: 0.35,
+    amRate: 35, amDepth: 0.2, noiseVol: 0.3, vibRate: 5, vibDepth: 10
+  });
+  crowNote(base * 1.1, t + 0.28, 0.1, 0.25, {
+    pitchStart: 1.0, pitchEnd: 1.15,
+    amRate: 40, amDepth: 0.1, noiseVol: 0.15, vibRate: 8, vibDepth: 8
+  });
+  crowNote(base * 1.3, t + 0.42, 0.2, 0.5, {
+    pitchStart: 0.85, pitchPeak: 1.25, pitchEnd: 1.1, peakTime: 0.4,
+    amRate: 38, amDepth: 0.2, noiseVol: 0.25, vibRate: 6, vibDepth: 15
+  });
+  crowNote(base * 1.2, t + 0.65, 0.12, 0.35, {
+    pitchStart: 1.2, pitchEnd: 0.8,
+    amRate: 42, amDepth: 0.15, noiseVol: 0.2, vibRate: 7, vibDepth: 12
+  });
+  crowNote(base * 1.5, t + 0.82, 0.9, 0.55, {
+    pitchStart: 0.9, pitchPeak: 1.15, pitchEnd: 0.6, peakTime: 0.15,
+    sustain: true,
+    amRate: 28, amDepth: 0.25, noiseVol: 0.3, vibRate: 5.5, vibDepth: 25
+  });
+}
+
+// ─── Sprite Drawing (Modern) ────────────────────────────────────────
+// Helper: draw an ellipse with gradient fill
+function gradEllipse(cx, cy, rx, ry, color1, color2) {
+  const g = ctx.createRadialGradient(cx - rx * 0.25, cy - ry * 0.3, 0, cx, cy, Math.max(rx, ry));
+  g.addColorStop(0, color1);
+  g.addColorStop(1, color2);
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Helper: draw a wing as a curved shape
+function drawWing(x, y, w, h, color, flip) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  const sx = flip ? -1 : 1;
+  ctx.ellipse(x, y, w, h, (flip ? -0.3 : 0.3), 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Player water hose nozzle (modern)
+function drawPlayer(x, y) {
+  ctx.save();
+  ctx.translate(x, y);
+  // Drop shadow
+  ctx.shadowColor = 'rgba(50,150,255,0.4)';
+  ctx.shadowBlur = 8;
+  // Hose connection
+  const hg = ctx.createLinearGradient(-4, 12, 4, 12);
+  hg.addColorStop(0, '#15a'); hg.addColorStop(0.5, '#4af'); hg.addColorStop(1, '#15a');
+  ctx.fillStyle = hg;
+  ctx.beginPath();
+  ctx.roundRect(-4, 12, 8, 6, 2);
+  ctx.fill();
+  // Handle grip
+  ctx.shadowBlur = 0;
+  const gg = ctx.createLinearGradient(-6, 4, 6, 4);
+  gg.addColorStop(0, '#a00'); gg.addColorStop(0.5, '#f44'); gg.addColorStop(1, '#a00');
+  ctx.fillStyle = gg;
+  ctx.beginPath();
+  ctx.roundRect(-6, 4, 12, 9, 3);
+  ctx.fill();
+  // Nozzle body
+  const ng = ctx.createLinearGradient(-5, -4, 5, -4);
+  ng.addColorStop(0, '#666'); ng.addColorStop(0.3, '#bbb'); ng.addColorStop(0.7, '#ccc'); ng.addColorStop(1, '#666');
+  ctx.fillStyle = ng;
+  ctx.beginPath();
+  ctx.roundRect(-5, -5, 10, 10, 2);
+  ctx.fill();
+  // Nozzle tip
+  const tg = ctx.createLinearGradient(-3, -12, 3, -12);
+  tg.addColorStop(0, '#999'); tg.addColorStop(0.5, '#eee'); tg.addColorStop(1, '#999');
+  ctx.fillStyle = tg;
+  ctx.beginPath();
+  ctx.moveTo(-2, -5);
+  ctx.lineTo(-3, -12);
+  ctx.lineTo(3, -12);
+  ctx.lineTo(2, -5);
+  ctx.fill();
+  // Water glow at tip
+  ctx.shadowColor = 'rgba(100,200,255,0.6)';
+  ctx.shadowBlur = 6;
+  ctx.fillStyle = 'rgba(100,200,255,0.5)';
+  ctx.beginPath();
+  ctx.arc(0, -12, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  // Trigger
+  ctx.fillStyle = '#800';
+  ctx.beginPath();
+  ctx.roundRect(-2, 2, 4, 4, 1);
+  ctx.fill();
+  // Shine highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillRect(2, -3, 1.5, 5);
+  ctx.restore();
+}
+
+// Small chicken (chick) - cute round yellow bird
+function drawBee(x, y, frame) {
+  ctx.save();
+  ctx.translate(x, y);
+  const bob = Math.sin(frame * 0.5) * 1.5;
+  const wingAng = Math.sin(frame * 0.8) * 0.5;
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(0, 10, 6, 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Wing (back)
+  ctx.save();
+  ctx.translate(-5, -1 + bob);
+  ctx.rotate(-0.3 + wingAng);
+  gradEllipse(0, 0, 5, 3.5, '#ffe850', '#ccb020');
+  ctx.restore();
+  // Body
+  gradEllipse(0, 1 + bob, 7, 6, '#ffe840', '#dda800');
+  // Head
+  gradEllipse(1, -6 + bob, 5.5, 5, '#fff060', '#ddb800');
+  // Comb
+  ctx.fillStyle = '#f00';
+  ctx.beginPath();
+  ctx.arc(0, -11 + bob, 2, 0, Math.PI * 2);
+  ctx.arc(2, -10.5 + bob, 1.5, 0, Math.PI * 2);
+  ctx.fill();
+  // Eye
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(3, -6 + bob, 1.8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(3.5, -6.5 + bob, 0.7, 0, Math.PI * 2);
+  ctx.fill();
+  // Beak
+  ctx.fillStyle = '#f90';
+  ctx.beginPath();
+  ctx.moveTo(5.5, -6 + bob);
+  ctx.lineTo(9, -5 + bob);
+  ctx.lineTo(5.5, -4 + bob);
+  ctx.fill();
+  // Legs
+  ctx.strokeStyle = '#e80';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(-2, 6 + bob); ctx.lineTo(-3, 10);
+  ctx.moveTo(2, 6 + bob); ctx.lineTo(3, 10);
+  ctx.stroke();
+  // Wing (front)
+  ctx.save();
+  ctx.translate(5, -1 + bob);
+  ctx.rotate(0.3 - wingAng);
+  gradEllipse(0, 0, 4.5, 3, '#ffe850', '#ccb020');
+  ctx.restore();
+  ctx.restore();
+}
+
+// Medium chicken (hen) - reddish-brown hen
+function drawButterfly(x, y, frame) {
+  ctx.save();
+  ctx.translate(x, y);
+  const bob = Math.sin(frame * 0.4) * 1.2;
+  const wingAng = Math.sin(frame * 0.7) * 0.45;
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(0, 12, 8, 2.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Tail feathers
+  ctx.save();
+  ctx.translate(-8, -3 + bob);
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = ['#882020', '#993333', '#772222'][i];
+    ctx.beginPath();
+    ctx.ellipse(-i * 2, -i * 2, 4, 2, -0.6 - i * 0.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+  // Wing (back)
+  ctx.save();
+  ctx.translate(-7, 0 + bob);
+  ctx.rotate(-0.2 + wingAng);
+  gradEllipse(0, 0, 6, 4.5, '#dd6655', '#993322');
+  ctx.restore();
+  // Body
+  gradEllipse(0, 2 + bob, 8, 7.5, '#e05545', '#a02020');
+  // Head
+  gradEllipse(2, -7 + bob, 6, 5.5, '#ee6655', '#bb3020');
+  // Comb
+  ctx.fillStyle = '#f00';
+  ctx.beginPath();
+  ctx.arc(1, -12.5 + bob, 2.2, 0, Math.PI * 2);
+  ctx.arc(3.5, -12 + bob, 1.8, 0, Math.PI * 2);
+  ctx.fill();
+  // Eye
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(4, -7 + bob, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(4.5, -7 + bob, 1.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(5, -7.5 + bob, 0.6, 0, Math.PI * 2);
+  ctx.fill();
+  // Beak
+  const bg = ctx.createLinearGradient(7, -7, 12, -5);
+  bg.addColorStop(0, '#fa0'); bg.addColorStop(1, '#d80');
+  ctx.fillStyle = bg;
+  ctx.beginPath();
+  ctx.moveTo(7, -7 + bob);
+  ctx.lineTo(12, -5.5 + bob);
+  ctx.lineTo(7, -4 + bob);
+  ctx.fill();
+  // Wattle
+  ctx.fillStyle = '#f33';
+  ctx.beginPath();
+  ctx.ellipse(6, -3 + bob, 2, 2.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Legs
+  ctx.strokeStyle = '#e80';
+  ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  ctx.moveTo(-2, 9 + bob); ctx.lineTo(-3, 13);
+  ctx.moveTo(3, 9 + bob); ctx.lineTo(4, 13);
+  ctx.stroke();
+  // Wing (front)
+  ctx.save();
+  ctx.translate(7, 0 + bob);
+  ctx.rotate(0.2 - wingAng);
+  gradEllipse(0, 0, 5.5, 4, '#dd6655', '#993322');
+  ctx.restore();
+  ctx.restore();
+}
+
+// Boss chicken (rooster) - large and colorful
+function drawBoss(x, y, frame, hp) {
+  ctx.save();
+  ctx.translate(x, y);
+  const bob = Math.sin(frame * 0.35) * 1.5;
+  const wingAng = Math.sin(frame * 0.6) * 0.5;
+  const c1 = hp > 1 ? '#55cc55' : '#ff9944';
+  const c2 = hp > 1 ? '#228822' : '#aa4422';
+  const c1h = hp > 1 ? '#88ee88' : '#ffbb66';
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(0, 16, 10, 3, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Tail feathers (big, colorful)
+  ctx.save();
+  ctx.translate(-10, -4 + bob);
+  const tailColors = hp > 1
+    ? ['#1a6', '#183', '#26a', '#2a2', '#183']
+    : ['#a62', '#853', '#964', '#a42', '#853'];
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = tailColors[i];
+    ctx.beginPath();
+    ctx.ellipse(-i * 2.5, -i * 2.5, 5, 2.5, -0.5 - i * 0.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+  // Wing (back)
+  ctx.save();
+  ctx.translate(-9, 1 + bob);
+  ctx.rotate(-0.2 + wingAng);
+  gradEllipse(0, 0, 7, 5.5, c1, c2);
+  ctx.restore();
+  // Body
+  gradEllipse(0, 2 + bob, 10, 9, c1h, c2);
+  // Head
+  gradEllipse(2, -8 + bob, 7, 6.5, c1h, c2);
+  // Large comb (rooster crown)
+  ctx.fillStyle = '#f00';
+  ctx.beginPath();
+  ctx.arc(-1, -15 + bob, 3, 0, Math.PI * 2);
+  ctx.arc(3, -14.5 + bob, 2.5, 0, Math.PI * 2);
+  ctx.arc(6, -13 + bob, 2, 0, Math.PI * 2);
+  ctx.fill();
+  // Eye
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(5, -8 + bob, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(5.8, -8 + bob, 1.8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(6.3, -8.8 + bob, 0.7, 0, Math.PI * 2);
+  ctx.fill();
+  // Beak
+  const bkg = ctx.createLinearGradient(9, -8, 15, -6);
+  bkg.addColorStop(0, '#fa0'); bkg.addColorStop(1, '#c70');
+  ctx.fillStyle = bkg;
+  ctx.beginPath();
+  ctx.moveTo(9, -9 + bob);
+  ctx.lineTo(15, -6.5 + bob);
+  ctx.lineTo(9, -4 + bob);
+  ctx.fill();
+  // Wattle
+  ctx.fillStyle = '#f33';
+  ctx.beginPath();
+  ctx.ellipse(7, -3 + bob, 2.5, 3.5, 0.1, 0, Math.PI * 2);
+  ctx.fill();
+  // Legs
+  ctx.strokeStyle = '#e90';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-3, 10 + bob); ctx.lineTo(-4, 16);
+  ctx.moveTo(4, 10 + bob); ctx.lineTo(5, 16);
+  ctx.stroke();
+  // Wing (front)
+  ctx.save();
+  ctx.translate(9, 1 + bob);
+  ctx.rotate(0.2 - wingAng);
+  gradEllipse(0, 0, 6.5, 5, c1, c2);
+  ctx.restore();
+  ctx.restore();
+}
+
+// Hawk - predatory bird with spread wings
+function drawHawk(x, y, frame, dir) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(dir, 1); // flip based on flight direction
+  const wingBeat = Math.sin(frame * 0.3) * 0.25;
+  // Wing shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(0, 8, 22, 4, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Left wing
+  ctx.save();
+  ctx.translate(-6, 0);
+  ctx.rotate(-0.15 + wingBeat);
+  const lwg = ctx.createLinearGradient(0, 0, -20, -3);
+  lwg.addColorStop(0, '#5a3a1a'); lwg.addColorStop(0.6, '#3a2210'); lwg.addColorStop(1, '#1a1008');
+  ctx.fillStyle = lwg;
+  ctx.beginPath();
+  ctx.moveTo(0, -2);
+  ctx.quadraticCurveTo(-10, -8 + wingBeat * 8, -22, -4 + wingBeat * 12);
+  ctx.lineTo(-20, 1);
+  ctx.quadraticCurveTo(-10, -1, 0, 2);
+  ctx.fill();
+  // Wing feather tips
+  ctx.strokeStyle = '#2a1808';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const fx = -16 - i * 1.5;
+    const fy = -3 + wingBeat * 10 + i * 0.8;
+    ctx.beginPath();
+    ctx.moveTo(fx + 3, fy - 1);
+    ctx.lineTo(fx, fy + 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+  // Right wing
+  ctx.save();
+  ctx.translate(6, 0);
+  ctx.rotate(0.15 - wingBeat);
+  const rwg = ctx.createLinearGradient(0, 0, 20, -3);
+  rwg.addColorStop(0, '#5a3a1a'); rwg.addColorStop(0.6, '#3a2210'); rwg.addColorStop(1, '#1a1008');
+  ctx.fillStyle = rwg;
+  ctx.beginPath();
+  ctx.moveTo(0, -2);
+  ctx.quadraticCurveTo(10, -8 + wingBeat * 8, 22, -4 + wingBeat * 12);
+  ctx.lineTo(20, 1);
+  ctx.quadraticCurveTo(10, -1, 0, 2);
+  ctx.fill();
+  ctx.strokeStyle = '#2a1808';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const fx = 16 + i * 1.5;
+    const fy = -3 + wingBeat * 10 + i * 0.8;
+    ctx.beginPath();
+    ctx.moveTo(fx - 3, fy - 1);
+    ctx.lineTo(fx, fy + 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+  // Body
+  const bg = ctx.createRadialGradient(0, -1, 0, 0, 0, 8);
+  bg.addColorStop(0, '#7a5030'); bg.addColorStop(1, '#3a2010');
+  ctx.fillStyle = bg;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 6, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Head
+  const hg = ctx.createRadialGradient(6, -6, 0, 5, -5, 5);
+  hg.addColorStop(0, '#eee'); hg.addColorStop(0.6, '#ddd'); hg.addColorStop(1, '#8a6030');
+  ctx.fillStyle = hg;
+  ctx.beginPath();
+  ctx.arc(5, -5, 4.5, 0, Math.PI * 2);
+  ctx.fill();
+  // Eye - fierce
+  ctx.fillStyle = '#ff0';
+  ctx.beginPath();
+  ctx.arc(7.5, -5.5, 1.8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(7.8, -5.5, 1, 0, Math.PI * 2);
+  ctx.fill();
+  // Angry brow
+  ctx.strokeStyle = '#4a2a10';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.moveTo(6, -7.5);
+  ctx.lineTo(9, -6.8);
+  ctx.stroke();
+  // Hooked beak
+  ctx.fillStyle = '#333';
+  ctx.beginPath();
+  ctx.moveTo(9, -5.5);
+  ctx.lineTo(14, -5);
+  ctx.quadraticCurveTo(13, -3.5, 11, -3.8);
+  ctx.lineTo(9, -4);
+  ctx.fill();
+  // Beak tip highlight
+  ctx.fillStyle = '#555';
+  ctx.beginPath();
+  ctx.moveTo(12, -5);
+  ctx.lineTo(14, -5);
+  ctx.quadraticCurveTo(13.5, -4, 12.5, -4.2);
+  ctx.fill();
+  // Tail feathers
+  ctx.fillStyle = '#3a2010';
+  ctx.beginPath();
+  ctx.moveTo(-4, 6);
+  ctx.lineTo(-10, 12);
+  ctx.lineTo(-7, 11);
+  ctx.lineTo(-5, 13);
+  ctx.lineTo(-3, 11);
+  ctx.lineTo(-1, 7);
+  ctx.fill();
+  // Talons (tucked)
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-1, 7); ctx.lineTo(-2, 10); ctx.lineTo(-3, 11);
+  ctx.moveTo(1, 7); ctx.lineTo(2, 10); ctx.lineTo(1, 11);
+  ctx.stroke();
+  // Menacing glow
+  ctx.shadowColor = 'rgba(255,100,0,0.4)';
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = 'rgba(255,100,0,0.08)';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 24, 10, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+// Explosion - modern particle system
+function drawExplosion(x, y, frame) {
+  ctx.save();
+  ctx.translate(x, y);
+  const progress = frame / 15;
+  // Screen flash on first frame
+  if (frame === 0) {
+    ctx.restore();
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,255,200,0.12)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(x, y);
+  }
+  // Glow
+  const glowR = 15 + frame * 3;
+  const glowAlpha = Math.max(0, 0.4 - progress * 0.5);
+  const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, glowR);
+  glow.addColorStop(0, `rgba(255,200,50,${glowAlpha})`);
+  glow.addColorStop(1, 'rgba(255,100,0,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+  ctx.fill();
+  // Particles
+  for (let i = 0; i < 16; i++) {
+    const angle = (Math.PI * 2 / 16) * i + i * 0.7;
+    const speed = 2 + (i % 3) * 1.5;
+    const decel = 1 - progress * 0.6;
+    const dist = speed * frame * decel;
+    const px = Math.cos(angle) * dist;
+    const py = Math.sin(angle) * dist;
+    const alpha = Math.max(0, 1 - progress * 1.3);
+    const size = Math.max(0.5, (3.5 - frame * 0.2) * (1 - (i % 4) * 0.15));
+    // Color: white→yellow→orange→red over lifetime
+    let r = 255, g = Math.max(0, 255 - frame * 25), b = Math.max(0, 100 - frame * 15);
+    ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+    ctx.beginPath();
+    ctx.arc(px, py, size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Feather particles (small lines)
+  for (let i = 0; i < 6; i++) {
+    const angle = (Math.PI * 2 / 6) * i + frame * 0.15 + i;
+    const dist = 3 + frame * (1.5 + i * 0.4);
+    const px = Math.cos(angle) * dist;
+    const py = Math.sin(angle) * dist + frame * 0.5;
+    const alpha = Math.max(0, 1 - progress * 1.5);
+    const rot = angle + frame * 0.2;
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(rot);
+    ctx.strokeStyle = `rgba(255,240,200,${alpha})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(-3, 0);
+    ctx.quadraticCurveTo(0, -1.5, 3, 0);
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+// Hawk explosion - massive shockwave + screen shake + tons of particles
+let screenShake = 0;
+function drawHawkExplosion(x, y, frame) {
+  const maxF = 30;
+  const progress = frame / maxF;
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Soft white flash (feather poof)
+  if (frame < 4) {
+    ctx.restore();
+    ctx.save();
+    const flashAlpha = (4 - frame) * 0.08;
+    ctx.fillStyle = `rgba(255,250,240,${flashAlpha})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(x, y);
+    screenShake = 4;
+  }
+  if (screenShake > 0) screenShake *= 0.85;
+
+  // Expanding white puff cloud
+  if (frame < 20) {
+    const puffProgress = frame / 20;
+    const puffR = 10 + puffProgress * 50;
+    const puffAlpha = Math.max(0, 0.5 - puffProgress * 0.6);
+    const puff = ctx.createRadialGradient(0, 0, 0, 0, 0, puffR);
+    puff.addColorStop(0, `rgba(255,255,250,${puffAlpha})`);
+    puff.addColorStop(0.4, `rgba(220,200,170,${puffAlpha * 0.6})`);
+    puff.addColorStop(1, 'rgba(180,150,100,0)');
+    ctx.fillStyle = puff;
+    ctx.beginPath();
+    ctx.arc(0, 0, puffR, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Feather burst particles (cream/brown/white puffs flying outward)
+  const featherColors = [
+    [140, 90, 40],   // brown
+    [255, 245, 220], // cream
+    [200, 170, 100], // tan
+    [255, 255, 240], // white
+  ];
+  for (let i = 0; i < 20; i++) {
+    const angle = (Math.PI * 2 / 20) * i + i * 0.7;
+    const speed = 1.5 + (i % 4) * 1.2;
+    const decel = 1 - progress * 0.4;
+    const dist = speed * frame * decel * 0.6;
+    const px = Math.cos(angle) * dist;
+    const py = Math.sin(angle) * dist + frame * 0.3; // slight gravity
+    const alpha = Math.max(0, 1 - progress * 1.2);
+    const size = Math.max(0.5, (3 - frame * 0.08));
+    const c = featherColors[i % 4];
+    ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
+    ctx.beginPath();
+    ctx.arc(px, py, size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Large feather debris spinning outward
+  for (let i = 0; i < 16; i++) {
+    const angle = (Math.PI * 2 / 16) * i + frame * 0.08 + i * 0.9;
+    const dist = 5 + frame * (1.8 + i * 0.4);
+    const px = Math.cos(angle) * dist;
+    const py = Math.sin(angle) * dist + frame * 1.0; // gravity
+    const alpha = Math.max(0, 1 - progress * 1.1);
+    const rot = angle + frame * 0.2 + i;
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(rot);
+    const c = featherColors[i % 4];
+    // Feather quill shape
+    ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},${alpha * 0.4})`;
+    ctx.strokeStyle = `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(-5, 0);
+    ctx.quadraticCurveTo(0, -2.5, 5, 0);
+    ctx.quadraticCurveTo(0, 2.5, -5, 0);
+    ctx.fill();
+    ctx.stroke();
+    // Rachis line
+    ctx.beginPath();
+    ctx.moveTo(-5, 0);
+    ctx.lineTo(5, 0);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
+// Star - multi-layer with glow
+function drawStar(x, y, brightness, size, tint) {
+  if (size >= 2) {
+    // Glow for larger stars
+    ctx.fillStyle = `rgba(${tint},${brightness * 0.3})`;
+    ctx.beginPath();
+    ctx.arc(x, y, size + 1, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = `rgba(${tint},${brightness})`;
+  ctx.beginPath();
+  ctx.arc(x, y, size * 0.5, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ─── Input ───────────────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  // Handle initials entry
+  if (gameState === 'enterInitials') {
+    e.preventDefault();
+    if (e.code === 'Backspace' && initials.length > 0) {
+      initials = initials.slice(0, -1);
+    } else if (e.code === 'Enter' && initials.length > 0) {
+      // Save score to leaderboard
+      leaderboard.push({ name: initials, score: score });
+      leaderboard.sort((a, b) => b.score - a.score);
+      leaderboard = leaderboard.slice(0, 10); // Keep top 10
+      localStorage.setItem('galagaLeaderboard', JSON.stringify(leaderboard));
+      gameState = 'showLeaderboard';
+      gameOverTimer = 60;
+    } else if (/^[A-Za-z]$/.test(e.key) && initials.length < 3) {
+      initials += e.key.toUpperCase();
+    }
+  }
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ─── Game State ──────────────────────────────────────────────────────
+let gameState = 'title'; // title, playing, stageIntro, gameOver, respawning, enterInitials
+let score = 0;
+let highScore = parseInt(localStorage.getItem('galagaHigh') || '0');
+let leaderboard = JSON.parse(localStorage.getItem('galagaLeaderboard') || '[]');
+let initials = '';
+let initialsBlink = 0;
+let lives = 3;
+let stage = 1;
+let stageTimer = 0;
+let respawnTimer = 0;
+let gameOverTimer = 0;
+let shotsHit = 0;
+let shotsFired = 0;
+
+// Bonus level tracking
+let nextBonusAt = 5000;
+let bonusPending = false;
+let bonusActive = false;
+let bonusTimer = 0;
+let bonusChickensTotal = 0;
+let bonusChickensHit = 0;
+let bonusTimeRemaining = 0;
+
+// Donkey bray tracking
+let nextDonkeyAt = 10000;
+
+// Player
+const player = { x: W / 2, y: H - 60, speed: 4, alive: true, shootCooldown: 0 };
+
+// Bullets
+let playerBullets = [];
+let enemyBullets = [];
+
+// Enemies
+let enemies = [];
+let enemyFormationX = 0;
+let enemyFormationDir = 1;
+let formationSpeed = 0.3;
+let formationAmplitude = 30;
+let animFrame = 0;
+let animTimer = 0;
+let cluckTimer = 0;
+let formationYOffset = 0; // Formation descends over time
+
+// Dive attacks
+let divingEnemies = [];
+
+// Explosions
+let explosions = [];
+
+// Hawk (bonus enemy)
+let hawk = null; // { x, y, dir, alive }
+let hawkTimer = 0;
+let hawkInterval = 900 + Math.floor(Math.random() * 900); // 15-30 sec at 60fps
+let hawkFeathers = []; // Falling feathers from hawk kill
+
+// Stars - parallax layers with tint and size
+const stars = [];
+const tints = ['255,255,255', '200,220,255', '255,240,200', '180,200,255'];
+for (let i = 0; i < 150; i++) {
+  const tier = i < 100 ? 0 : i < 130 ? 1 : 2; // 0=tiny, 1=medium, 2=large
+  stars.push({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    speed: [0.3 + Math.random() * 0.7, 0.8 + Math.random() * 1, 1.5 + Math.random() * 1.5][tier],
+    baseBright: 0.3 + Math.random() * 0.5,
+    twinkleSpeed: 0.01 + Math.random() * 0.04,
+    twinkleOffset: Math.random() * Math.PI * 2,
+    size: [0.6, 1.2, 2][tier],
+    tint: tints[Math.floor(Math.random() * tints.length)]
+  });
+}
+
+// ─── Enemy Formation ─────────────────────────────────────────────────
+function createFormation() {
+  enemies = [];
+  divingEnemies = [];
+  formationYOffset = 0;
+
+  const cols = 10;
+  const spacingX = 32;
+  const spacingY = 30;
+  const startX = W / 2 - (cols - 1) * spacingX / 2;
+  const startY = 60;
+
+  // Row 0: 4 bosses
+  for (let c = 0; c < 4; c++) {
+    enemies.push({
+      type: 'boss', hp: 2,
+      formX: startX + (c + 3) * spacingX,
+      formY: startY,
+      x: -20, y: -20,
+      alive: true, entering: true,
+      enterPhase: 0,
+      enterDelay: c * 8,
+      col: c + 3, row: 0,
+      diving: false, diveData: null,
+      hitFlash: 0, trail: []
+    });
+  }
+  // Row 1: 8 butterflies
+  for (let c = 0; c < 8; c++) {
+    enemies.push({
+      type: 'butterfly', hp: 1,
+      formX: startX + (c + 1) * spacingX,
+      formY: startY + spacingY,
+      x: -20, y: -20,
+      alive: true, entering: true,
+      enterPhase: 0,
+      enterDelay: 40 + c * 6,
+      col: c + 1, row: 1,
+      diving: false, diveData: null,
+      hitFlash: 0, trail: []
+    });
+  }
+  // Rows 2-3: 10 bees each
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < cols; c++) {
+      enemies.push({
+        type: 'bee', hp: 1,
+        formX: startX + c * spacingX,
+        formY: startY + (r + 2) * spacingY,
+        x: -20, y: -20,
+        alive: true, entering: true,
+        enterPhase: 0,
+        enterDelay: 80 + r * 60 + c * 6,
+        col: c, row: r + 2,
+        diving: false, diveData: null,
+        hitFlash: 0, trail: []
+      });
+    }
+  }
+}
+
+// ─── Entry Paths ─────────────────────────────────────────────────────
+function getEntryPosition(enemy, phase) {
+  // Enemies fly in from top in curved paths
+  const row = enemy.row;
+  const side = enemy.col < 5 ? -1 : 1;
+  const t = phase / 120;
+
+  if (t >= 1) return { x: enemy.formX, y: enemy.formY, done: true };
+
+  let x, y;
+  if (row === 0) {
+    // Bosses: come from top center, loop around
+    const startX = W / 2 + side * 60;
+    const startY = -30;
+    if (t < 0.4) {
+      x = startX + Math.sin(t / 0.4 * Math.PI) * side * 80;
+      y = startY + (t / 0.4) * (H * 0.5);
+    } else {
+      const t2 = (t - 0.4) / 0.6;
+      x = enemy.formX + Math.sin(t2 * Math.PI * 2) * 40 * (1 - t2);
+      y = H * 0.5 + (enemy.formY - H * 0.5) * t2;
+    }
+  } else if (row === 1) {
+    // Butterflies: come from sides
+    const startX = side > 0 ? W + 30 : -30;
+    const startY = 80;
+    if (t < 0.3) {
+      x = startX + (W / 2 - startX) * (t / 0.3);
+      y = startY + Math.sin(t / 0.3 * Math.PI) * 100;
+    } else {
+      const t2 = (t - 0.3) / 0.7;
+      x = W / 2 + (enemy.formX - W / 2) * t2 + Math.sin(t2 * Math.PI * 3) * 30 * (1 - t2);
+      y = startY + 100 * Math.sin(Math.PI * 0.3 / 0.3) * (1 - t2) + enemy.formY * t2;
+    }
+  } else {
+    // Bees: come from top, sweeping
+    const startX = side > 0 ? W + 30 : -30;
+    const startY = -30;
+    if (t < 0.5) {
+      x = startX + (W / 2 - startX) * (t / 0.5);
+      y = startY + t / 0.5 * H * 0.6;
+    } else {
+      const t2 = (t - 0.5) / 0.5;
+      x = W / 2 + (enemy.formX - W / 2) * t2;
+      y = H * 0.6 + (enemy.formY - H * 0.6) * t2;
+    }
+  }
+
+  return { x, y, done: false };
+}
+
+// ─── Dive Attack ─────────────────────────────────────────────────────
+let diveTimer = 0;
+let maxDivers = 2;
+
+function startDive(enemy) {
+  enemy.diving = true;
+  const targetX = player.x + (Math.random() - 0.5) * 80;
+  enemy.diveData = {
+    phase: 0,
+    startX: enemy.x, startY: enemy.y,
+    midX: targetX, midY: H * 0.6,
+    returning: false
+  };
+  playSound('dive');
+}
+
+function updateDive(enemy) {
+  const d = enemy.diveData;
+  d.phase += 0.004;
+
+  if (!d.returning) {
+    if (d.phase < 0.5) {
+      const t = d.phase / 0.5;
+      // Ease-in: start slow, accelerate as they dive
+      const eased = t * t;
+      enemy.x = d.startX + (d.midX - d.startX) * t + Math.sin(t * Math.PI * 3) * 30;
+      enemy.y = d.startY + (H + 40 - d.startY) * eased;
+    } else {
+      // Gone off screen, return from top
+      d.returning = true;
+      d.phase = 0;
+      enemy.x = enemy.formX + (Math.random() - 0.5) * 60;
+      enemy.y = -20;
+    }
+
+    // Shoot during dive
+    const diveShootChance = 0.003 + stage * 0.002;
+    if (Math.random() < diveShootChance && enemy.y < H - 100 && enemy.y > 0) {
+      const angle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+      const bulletSpd = Math.min(2 + stage * 0.2, 4);
+      enemyBullets.push({
+        x: enemy.x, y: enemy.y + 8,
+        vx: Math.cos(angle) * bulletSpd, vy: Math.sin(angle) * bulletSpd
+      });
+      playSound('enemyShoot');
+    }
+  } else {
+    const t = d.phase / 0.8;
+    if (t >= 1) {
+      enemy.diving = false;
+      enemy.diveData = null;
+      enemy.x = enemy.formX;
+      enemy.y = enemy.formY + formationYOffset;
+      return;
+    }
+    enemy.x = enemy.x + (enemy.formX - enemy.x) * 0.03;
+    enemy.y = -20 + (enemy.formY + formationYOffset + 20) * t;
+  }
+}
+
+// ─── Score Helper ────────────────────────────────────────────────────
+function addScore(pts) {
+  score += pts;
+  if (score > highScore) {
+    highScore = score;
+    localStorage.setItem('galagaHigh', highScore);
+  }
+  if (score >= nextBonusAt) {
+    bonusPending = true;
+    nextBonusAt += 5000;
+  }
+  if (score >= nextDonkeyAt) {
+    nextDonkeyAt += 10000;
+    playDonkeyBray();
+  }
+}
+
+// ─── Donkey Bray Sound ──────────────────────────────────────────────
+function playDonkeyBray() {
+  if (samples.donkey) {
+    playSample('donkey', { rate: 1.0, volume: 2.5, duration: 4.0 });
+    return;
+  }
+  // ── Synthesized fallback ──
+  const t = audioCtx.currentTime + 0.05;
+  function brayNote(freq, start, dur, vol, opts = {}) {
+    const end = start + dur;
+    const master = audioCtx.createGain();
+    master.connect(audioCtx.destination);
+    master.gain.setValueAtTime(0.001, start);
+    master.gain.linearRampToValueAtTime(vol, start + dur * 0.1);
+    if (opts.sustain) {
+      master.gain.setValueAtTime(vol * 0.9, start + dur * 0.3);
+      master.gain.exponentialRampToValueAtTime(0.001, end);
+    } else {
+      master.gain.exponentialRampToValueAtTime(0.001, end);
+    }
+    const lfo = audioCtx.createOscillator();
+    lfo.frequency.setValueAtTime(opts.vibRate || 5, start);
+    const lfoGain = audioCtx.createGain();
+    lfoGain.gain.setValueAtTime(opts.vibDepth || 20, start);
+    lfo.connect(lfoGain);
+    lfo.start(start); lfo.stop(end + 0.02);
+    const amLfo = audioCtx.createOscillator();
+    amLfo.frequency.setValueAtTime(opts.amRate || 25, start);
+    const amGain = audioCtx.createGain();
+    amGain.gain.setValueAtTime(vol * (opts.amDepth || 0.3), start);
+    amLfo.connect(amGain);
+    amGain.connect(master.gain);
+    amLfo.start(start); amLfo.stop(end + 0.02);
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(freq * (opts.pitchStart || 1.0), start);
+    lfoGain.connect(osc.frequency);
+    if (opts.pitchEnd) {
+      osc.frequency.exponentialRampToValueAtTime(freq * opts.pitchEnd, end);
+    }
+    const f1 = audioCtx.createBiquadFilter();
+    f1.type = 'bandpass';
+    f1.frequency.setValueAtTime(freq * 2.5, start);
+    f1.Q.setValueAtTime(4, start);
+    const f2 = audioCtx.createBiquadFilter();
+    f2.type = 'peaking';
+    f2.frequency.setValueAtTime(freq * 4, start);
+    f2.gain.setValueAtTime(12, start);
+    f2.Q.setValueAtTime(2, start);
+    const oscGain = audioCtx.createGain();
+    oscGain.gain.setValueAtTime(0.5, start);
+    osc.connect(f1); f1.connect(f2); f2.connect(oscGain); oscGain.connect(master);
+    osc.start(start); osc.stop(end + 0.02);
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = noiseBuffer;
+    const nFilt = audioCtx.createBiquadFilter();
+    nFilt.type = 'bandpass';
+    nFilt.frequency.setValueAtTime(freq * 3, start);
+    nFilt.Q.setValueAtTime(1.5, start);
+    const nGain = audioCtx.createGain();
+    nGain.gain.setValueAtTime(opts.noiseVol || 0.25, start);
+    nGain.gain.exponentialRampToValueAtTime(0.001, end);
+    noise.connect(nFilt); nFilt.connect(nGain); nGain.connect(master);
+    noise.start(start); noise.stop(end + 0.02);
+  }
+  const base = 180;
+  brayNote(base, t, 0.6, 0.7, {
+    pitchStart: 0.8, pitchEnd: 2.2,
+    vibRate: 6, vibDepth: 15, amRate: 30, amDepth: 0.35, noiseVol: 0.3
+  });
+  brayNote(base * 1.5, t + 0.65, 0.8, 0.8, {
+    pitchStart: 1.6, pitchEnd: 0.5, sustain: true,
+    vibRate: 4.5, vibDepth: 30, amRate: 22, amDepth: 0.4, noiseVol: 0.35
+  });
+}
+
+// ─── Bonus Formation ────────────────────────────────────────────────
+function createBonusFormation() {
+  enemies = [];
+  divingEnemies = [];
+  formationYOffset = 0;
+  bonusChickensTotal = 30;
+
+  for (let w = 0; w < 3; w++) {
+    const types = ['boss', 'butterfly', 'bee'];
+    for (let i = 0; i < 10; i++) {
+      enemies.push({
+        type: types[w], hp: 1, // All 1 HP in bonus
+        formX: -999, formY: -999,
+        x: -40, y: -40,
+        alive: true, entering: true,
+        enterPhase: 0,
+        enterDelay: w * 180 + i * 12,
+        col: i, row: w,
+        diving: false, diveData: null,
+        hitFlash: 0, trail: [],
+        bonusEnemy: true, bonusWave: w, bonusIndex: i
+      });
+    }
+  }
+}
+
+function getBonusEntryPosition(enemy, phase) {
+  const t = phase / 200;
+  if (t >= 1) return { x: enemy.x, y: H + 50, done: true };
+
+  const w = enemy.bonusWave;
+  const i = enemy.bonusIndex;
+  // Offset each enemy slightly in time
+  const tt = Math.max(0, t - i * 0.02);
+  if (tt <= 0) return { x: -40, y: -40, done: false };
+
+  let x, y;
+  if (w === 0) {
+    // Wave 1: Sine wave from left
+    x = -30 + tt * (W + 60);
+    y = H * 0.3 + Math.sin(tt * Math.PI * 3) * 80;
+  } else if (w === 1) {
+    // Wave 2: Reverse sine from right
+    x = W + 30 - tt * (W + 60);
+    y = H * 0.4 + Math.sin(tt * Math.PI * 4) * 60;
+  } else {
+    // Wave 3: Diagonal zigzag from top
+    x = W / 2 + Math.sin(tt * Math.PI * 5) * 150;
+    y = -30 + tt * (H + 80);
+  }
+  return { x, y, done: false };
+}
+
+// ─── Game Logic ──────────────────────────────────────────────────────
+let frameCount = 0;
+
+function update() {
+  frameCount++;
+
+  // Animate stars with twinkle
+  for (const s of stars) {
+    s.y += s.speed;
+    if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+    s.brightness = s.baseBright + Math.sin(frameCount * s.twinkleSpeed + s.twinkleOffset) * 0.25;
+  }
+
+  if (gameState === 'title') {
+    if (keys['Space'] || keys['Enter']) {
+      gameState = 'stageIntro';
+      stage = 1;
+      score = 0;
+      lives = 3;
+      shotsHit = 0;
+      shotsFired = 0;
+      stageTimer = 140; // slightly longer to let crow finish
+      createFormation();
+      player.x = W / 2;
+      player.alive = true;
+      playerBullets = [];
+      enemyBullets = [];
+      explosions = [];
+      hawkFeathers = [];
+      hawk = null;
+      hawkTimer = 0;
+      hawkInterval = 900 + Math.floor(Math.random() * 900);
+      nextBonusAt = 5000;
+      bonusPending = false;
+      bonusActive = false;
+      nextDonkeyAt = 10000;
+      playCrowSound();
+    }
+    return;
+  }
+
+  if (gameState === 'stageIntro') {
+    stageTimer--;
+    if (stageTimer <= 0) {
+      gameState = 'playing';
+    }
+    return;
+  }
+
+  if (gameState === 'bonusIntro') {
+    bonusTimer--;
+    if (bonusTimer <= 0) {
+      gameState = 'bonusPlaying';
+      createBonusFormation();
+    }
+    return;
+  }
+
+  if (gameState === 'bonusResults') {
+    bonusTimer--;
+    if (bonusTimer <= 0 && (keys['Space'] || keys['Enter'])) {
+      bonusActive = false;
+      stage++;
+      stageTimer = 120;
+      gameState = 'stageIntro';
+      formationSpeed = 0.25 + stage * 0.04;
+      maxDivers = 1 + Math.floor(stage / 2);
+      createFormation();
+      player.alive = true;
+      player.x = W / 2;
+      playerBullets = [];
+      enemyBullets = [];
+      explosions = [];
+      hawkFeathers = [];
+      hawk = null;
+      hawkTimer = 0;
+      hawkInterval = 900 + Math.floor(Math.random() * 900);
+      playSound('stageStart');
+    }
+    return;
+  }
+
+  // ─ Check stage clear (runs even during respawning/gameOver) ─
+  if ((gameState === 'playing' || gameState === 'respawning' || gameState === 'gameOver') &&
+      enemies.length > 0 && enemies.every(e => !e.alive)) {
+    if (bonusPending && gameState !== 'gameOver') {
+      // Trigger bonus level
+      bonusPending = false;
+      bonusActive = true;
+      bonusTimer = 120;
+      bonusChickensHit = 0;
+      bonusChickensTotal = 0;
+      bonusTimeRemaining = 900; // 15 seconds
+      gameState = 'bonusIntro';
+      playerBullets = [];
+      enemyBullets = [];
+      explosions = [];
+      hawkFeathers = [];
+      hawk = null;
+      player.alive = true;
+      player.x = W / 2;
+      playSound('stageStart');
+    } else {
+      stage++;
+      stageTimer = 120;
+      gameState = 'stageIntro';
+      formationSpeed = 0.25 + stage * 0.04;
+      maxDivers = 1 + Math.floor(stage / 2);
+      createFormation();
+      player.alive = true;
+      player.x = W / 2;
+      playerBullets = [];
+      enemyBullets = [];
+      explosions = [];
+      hawkFeathers = [];
+      hawk = null;
+      hawkTimer = 0;
+      hawkInterval = 900 + Math.floor(Math.random() * 900);
+      playSound('stageStart');
+    }
+    return;
+  }
+
+  if (gameState === 'gameOver') {
+    gameOverTimer--;
+    if (gameOverTimer <= 0 && (keys['Space'] || keys['Enter'])) {
+      // Check if score qualifies for leaderboard
+      if (score > 0 && (leaderboard.length < 10 || score > leaderboard[leaderboard.length - 1].score)) {
+        gameState = 'enterInitials';
+        initials = '';
+        keys['Space'] = false;
+        keys['Enter'] = false;
+      } else {
+        gameState = 'title';
+      }
+    }
+    return;
+  }
+
+  if (gameState === 'enterInitials') {
+    // Handled by keydown listener
+    return;
+  }
+
+  if (gameState === 'showLeaderboard') {
+    gameOverTimer--;
+    if (gameOverTimer <= 0 && (keys['Space'] || keys['Enter'])) {
+      gameState = 'title';
+    }
+    return;
+  }
+
+  if (gameState === 'respawning') {
+    respawnTimer--;
+    if (respawnTimer <= 0) {
+      player.alive = true;
+      player.x = W / 2;
+      gameState = bonusActive ? 'bonusPlaying' : 'playing';
+    }
+    return;
+  }
+
+  // ─ Animation timer ─
+  animTimer++;
+  if (animTimer >= 15) { animTimer = 0; animFrame++; }
+
+  // ─ Ambient chicken clucking ─
+  cluckTimer++;
+  const aliveCount = enemies.filter(e => e.alive).length;
+  const cluckInterval = Math.max(20, 60 - aliveCount);
+  if (cluckTimer >= cluckInterval && enemies.some(e => e.alive && !e.entering)) {
+    cluckTimer = 0;
+    if (Math.random() < 0.6) {
+      playSound('cluck');
+    }
+  }
+
+  // ─ Player movement ─
+  if (player.alive) {
+    if (keys['ArrowLeft'] || keys['KeyA']) player.x -= player.speed;
+    if (keys['ArrowRight'] || keys['KeyD']) player.x += player.speed;
+    player.x = Math.max(16, Math.min(W - 16, player.x));
+
+    // Shooting
+    if (player.shootCooldown > 0) player.shootCooldown--;
+    if ((keys['Space'] || keys['ArrowUp'] || keys['KeyW']) && player.shootCooldown === 0 && playerBullets.length < 2) {
+      playerBullets.push({ x: player.x, y: player.y - 12 });
+      player.shootCooldown = 12;
+      shotsFired++;
+      playSound('shoot');
+    }
+  }
+
+  // ─ Player bullets ─
+  for (let i = playerBullets.length - 1; i >= 0; i--) {
+    playerBullets[i].y -= 8;
+    if (playerBullets[i].y < -10) playerBullets.splice(i, 1);
+  }
+
+  // ─ Enemy bullets ─
+  for (let i = enemyBullets.length - 1; i >= 0; i--) {
+    enemyBullets[i].x += enemyBullets[i].vx;
+    enemyBullets[i].y += enemyBullets[i].vy;
+    if (enemyBullets[i].y > H + 10 || enemyBullets[i].y < -10 ||
+        enemyBullets[i].x < -10 || enemyBullets[i].x > W + 10) {
+      enemyBullets.splice(i, 1);
+    }
+  }
+
+  // ─ Formation movement ─
+  enemyFormationX += formationSpeed * enemyFormationDir;
+  if (Math.abs(enemyFormationX) > formationAmplitude) {
+    enemyFormationDir *= -1;
+  }
+
+  // ─ Formation descent ─ enemies creep down toward player (not during bonus)
+  if (!bonusActive) {
+    const descentSpeed = 0.08 + stage * 0.02; // faster each stage
+    formationYOffset += descentSpeed;
+  }
+
+  // ─ Enemy updates ─
+  let allEntered = true;
+  for (const e of enemies) {
+    if (!e.alive) continue;
+
+    if (e.entering) {
+      if (e.enterDelay > 0) { e.enterDelay--; allEntered = false; continue; }
+      e.enterPhase++;
+      const pos = e.bonusEnemy
+        ? getBonusEntryPosition(e, e.enterPhase)
+        : getEntryPosition(e, e.enterPhase);
+      e.x = pos.x;
+      e.y = pos.y;
+      if (pos.done) {
+        if (e.bonusEnemy) {
+          e.alive = false; // Bonus enemies fly off screen
+        } else {
+          e.entering = false;
+          e.x = e.formX;
+          e.y = e.formY;
+        }
+      } else {
+        allEntered = false;
+      }
+    } else if (e.diving) {
+      updateDive(e);
+    } else {
+      // In formation - apply descent offset
+      e.x = e.formX + enemyFormationX;
+      e.y = e.formY + formationYOffset;
+    }
+    // Hit flash countdown
+    if (e.hitFlash > 0) e.hitFlash--;
+    // Dive trail (store position every 4 frames for afterimage)
+    if (e.diving && frameCount % 4 === 0) {
+      e.trail.unshift({ x: e.x, y: e.y });
+      if (e.trail.length > 3) e.trail.pop();
+    } else if (!e.diving) {
+      e.trail.length = 0;
+    }
+  }
+
+  // ─ Dive timer ─ (not during bonus)
+  if (!bonusActive && (allEntered || enemies.some(e => e.alive && !e.entering))) {
+    diveTimer++;
+    const diveInterval = Math.max(60, 240 - stage * 25);
+    if (diveTimer >= diveInterval) {
+      diveTimer = 0;
+      const currentDivers = enemies.filter(e => e.alive && e.diving).length;
+      const maxD = Math.min(1 + Math.floor(stage / 2), 5);
+      if (currentDivers < maxD) {
+        const candidates = enemies.filter(e => e.alive && !e.entering && !e.diving);
+        if (candidates.length > 0) {
+          const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+          startDive(chosen);
+        }
+      }
+    }
+  }
+
+  // ─ Random enemy shooting from formation ─ (not during bonus)
+  if (!bonusActive) {
+    const shootChance = 0.0003 + stage * 0.0004;
+    for (const e of enemies) {
+      if (!e.alive || e.entering || e.diving) continue;
+      if (Math.random() < shootChance) {
+        enemyBullets.push({
+          x: e.x, y: e.y + 10,
+          vx: (Math.random() - 0.5) * 1.5,
+          vy: 1.5 + stage * 0.2 + Math.random() * 1
+        });
+      }
+    }
+  }
+
+  // ─ Collision: player bullets vs enemies ─
+  for (let bi = playerBullets.length - 1; bi >= 0; bi--) {
+    const b = playerBullets[bi];
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      const dx = b.x - e.x;
+      const dy = b.y - e.y;
+      const hitDist = e.type === 'boss' ? 14 : 10;
+      if (Math.abs(dx) < hitDist && Math.abs(dy) < hitDist) {
+        playerBullets.splice(bi, 1);
+        e.hp--;
+        e.hitFlash = 4;
+        shotsHit++;
+        if (e.hp <= 0) {
+          e.alive = false;
+          let pts = 0;
+          if (e.type === 'bee') pts = e.diving ? 100 : 50;
+          else if (e.type === 'butterfly') pts = e.diving ? 160 : 80;
+          else if (e.type === 'boss') pts = e.diving ? 400 : 150;
+          addScore(pts);
+          if (e.bonusEnemy) bonusChickensHit++;
+          explosions.push({ x: e.x, y: e.y, frame: 0, points: pts });
+          playSound('explode');
+        }
+        break;
+      }
+    }
+  }
+
+  // ─ Collision: enemy bullets vs player ─
+  if (player.alive) {
+    for (let i = enemyBullets.length - 1; i >= 0; i--) {
+      const b = enemyBullets[i];
+      if (Math.abs(b.x - player.x) < 10 && Math.abs(b.y - player.y) < 10) {
+        enemyBullets.splice(i, 1);
+        killPlayer();
+        break;
+      }
+    }
+  }
+
+  // ─ Collision: diving enemies vs player ─
+  if (player.alive) {
+    for (const e of enemies) {
+      if (!e.alive || e.entering) continue;
+      if (Math.abs(e.x - player.x) < 14 && Math.abs(e.y - player.y) < 14) {
+        e.alive = false;
+        explosions.push({ x: e.x, y: e.y, frame: 0 });
+        killPlayer();
+        break;
+      }
+    }
+  }
+
+  // ─ Check if formation reached the bottom ─
+  if (player.alive) {
+    for (const e of enemies) {
+      if (!e.alive || e.entering || e.diving) continue;
+      if (e.y >= player.y - 10) {
+        killPlayer();
+        break;
+      }
+    }
+  }
+
+  // ─ Explosions ─
+  for (let i = explosions.length - 1; i >= 0; i--) {
+    explosions[i].frame++;
+    const maxFrame = explosions[i].hawkBlast ? 30 : 15;
+    if (explosions[i].frame > maxFrame) explosions.splice(i, 1);
+  }
+
+  // ─ Hawk Feather Rain ─
+  for (let i = hawkFeathers.length - 1; i >= 0; i--) {
+    const f = hawkFeathers[i];
+    f.life++;
+    f.vy += 0.06; // gravity
+    f.vx *= 0.995; // air resistance
+    f.vx += (Math.random() - 0.5) * 0.1; // flutter
+    if (f.vy > 3) f.vy = 3; // terminal velocity
+    f.x += f.vx;
+    f.y += f.vy;
+    f.rotation += f.rotSpeed;
+    if (f.y > H + 20 || f.x < -20 || f.x > W + 20 || f.life > f.maxLife) {
+      hawkFeathers.splice(i, 1);
+      continue;
+    }
+    // Collision with enemies
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      const dx = f.x - e.x;
+      const dy = f.y - e.y;
+      const hitDist = e.type === 'boss' ? 16 : 12;
+      if (Math.abs(dx) < hitDist && Math.abs(dy) < hitDist) {
+        e.hp--;
+        e.hitFlash = 4;
+        if (e.hp <= 0) {
+          e.alive = false;
+          let pts = 0;
+          if (e.type === 'bee') pts = e.diving ? 100 : 50;
+          else if (e.type === 'butterfly') pts = e.diving ? 160 : 80;
+          else if (e.type === 'boss') pts = e.diving ? 400 : 150;
+          addScore(pts);
+          explosions.push({ x: e.x, y: e.y, frame: 0, points: pts });
+          playSound('explode');
+        }
+        hawkFeathers.splice(i, 1);
+        break;
+      }
+    }
+  }
+
+  // ─ Hawk spawn & movement ─ (not during bonus)
+  if (!hawk && !bonusActive) {
+    hawkTimer++;
+    if (hawkTimer >= hawkInterval && enemies.some(e => e.alive && !e.entering)) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      hawk = {
+        x: dir === 1 ? -30 : W + 30,
+        y: 38 + Math.random() * 15,
+        dir: dir,
+        speed: 1.8 + Math.random() * 0.8
+      };
+      hawkTimer = 0;
+      hawkInterval = 900 + Math.floor(Math.random() * 900);
+      playSound('hawkScreech');
+    }
+  } else if (hawk) {
+    hawk.x += hawk.speed * hawk.dir;
+    // Off screen — remove
+    if ((hawk.dir === 1 && hawk.x > W + 40) || (hawk.dir === -1 && hawk.x < -40)) {
+      hawk = null;
+    }
+  }
+
+  // ─ Collision: player bullets vs hawk ─
+  if (hawk) {
+    for (let bi = playerBullets.length - 1; bi >= 0; bi--) {
+      const b = playerBullets[bi];
+      if (Math.abs(b.x - hawk.x) < 20 && Math.abs(b.y - hawk.y) < 12) {
+        playerBullets.splice(bi, 1);
+        shotsHit++;
+        // Hawk kill: 300 bonus points
+        addScore(300);
+        explosions.push({ x: hawk.x, y: hawk.y, frame: 0, points: 300, hawkBlast: true });
+        playSound('hawkDeath');
+        // Spawn feather rain instead of instant blast
+        const featherColors = ['brown', 'white', 'tan'];
+        for (let fi = 0; fi < 25; fi++) {
+          const angle = (Math.PI * 2 / 25) * fi + (Math.random() - 0.5) * 0.3;
+          const speed = 2 + Math.random() * 3;
+          hawkFeathers.push({
+            x: hawk.x, y: hawk.y,
+            vx: Math.cos(angle) * speed + (Math.random() - 0.5),
+            vy: Math.sin(angle) * speed - 2,
+            rotation: Math.random() * Math.PI * 2,
+            rotSpeed: (Math.random() - 0.5) * 0.15,
+            color: featherColors[fi % 3],
+            size: 0.8 + Math.random() * 0.7,
+            life: 0,
+            maxLife: 240 + Math.floor(Math.random() * 120)
+          });
+        }
+        hawk = null;
+        break;
+      }
+    }
+  }
+
+  // ─ Bonus stage countdown ─
+  if (gameState === 'bonusPlaying') {
+    bonusTimeRemaining--;
+    const allGone = enemies.every(e => !e.alive);
+    if (bonusTimeRemaining <= 0 || allGone) {
+      // Award bonus points
+      const bonusPts = bonusChickensHit * 100;
+      addScore(bonusPts);
+      gameState = 'bonusResults';
+      bonusTimer = 90; // Brief delay before allowing skip
+      playerBullets = [];
+      enemyBullets = [];
+      explosions = [];
+    }
+  }
+
+}
+
+function killPlayer() {
+  player.alive = false;
+  explosions.push({ x: player.x, y: player.y, frame: 0 });
+  playSound('playerDeath');
+  lives--;
+  if (lives <= 0) {
+    gameState = 'gameOver';
+    gameOverTimer = 60;
+  } else {
+    gameState = 'respawning';
+    respawnTimer = 90;
+  }
+  enemyBullets = [];
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────
+function draw() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  // Screen shake from hawk explosion
+  if (screenShake > 0.5) {
+    ctx.save();
+    ctx.translate(
+      (Math.random() - 0.5) * screenShake * 2,
+      (Math.random() - 0.5) * screenShake * 2
+    );
+  }
+
+  // Stars
+  for (const s of stars) {
+    drawStar(s.x, s.y, s.brightness, s.size, s.tint);
+  }
+
+  if (gameState === 'title') {
+    // Title screen - gradient title with glow
+    ctx.save();
+    const titleGrad = ctx.createLinearGradient(W / 2 - 190, 130, W / 2 + 190, 185);
+    titleGrad.addColorStop(0, '#f22');
+    titleGrad.addColorStop(0.25, '#ff4');
+    titleGrad.addColorStop(0.5, '#fff');
+    titleGrad.addColorStop(0.75, '#ff4');
+    titleGrad.addColorStop(1, '#f22');
+    ctx.fillStyle = titleGrad;
+    ctx.font = 'bold 38px Courier New';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#f44';
+    ctx.shadowBlur = 20;
+    ctx.fillText('SPACE', W / 2, 155);
+    ctx.fillText('CHICKENS', W / 2, 195);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    ctx.fillStyle = '#ff0';
+    ctx.font = '14px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('- SCORE TABLE -', W / 2, 260);
+
+    // Score table
+    ctx.textAlign = 'left';
+    const tableX = W / 2 - 90;
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Rooster', tableX + 40, 300);
+    ctx.fillText('150 / 400', tableX + 40, 320);
+    drawBoss(tableX + 10, 305, animFrame, 2);
+
+    ctx.fillText('Hen', tableX + 40, 360);
+    ctx.fillText(' 80 / 160', tableX + 40, 380);
+    drawButterfly(tableX + 10, 365, animFrame);
+
+    ctx.fillText('Chick', tableX + 40, 420);
+    ctx.fillText(' 50 / 100', tableX + 40, 440);
+    drawBee(tableX + 10, 425, animFrame);
+
+    ctx.textAlign = 'center';
+    ctx.save();
+    ctx.shadowColor = '#0ff';
+    ctx.shadowBlur = 8;
+    ctx.fillStyle = '#0ff';
+    ctx.font = '16px Courier New';
+    const blink = Math.floor(frameCount / 30) % 2;
+    if (blink) ctx.fillText('PRESS SPACE TO START', W / 2, 520);
+    ctx.restore();
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = '12px Courier New';
+    ctx.fillText('ARROWS: Move   SPACE: Fire', W / 2, 570);
+
+    ctx.fillStyle = '#666';
+    if (leaderboard.length > 0) {
+      ctx.fillText('TOP: ' + leaderboard[0].name + ' ' + leaderboard[0].score, W / 2, 600);
+    } else {
+      ctx.fillText('HIGH SCORE: ' + highScore, W / 2, 600);
+    }
+
+    // Subtle scan-line overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.04)';
+    for (let sy = 0; sy < H; sy += 3) {
+      ctx.fillRect(0, sy, W, 1);
+    }
+    return;
+  }
+
+  if (gameState === 'showLeaderboard') {
+    drawLeaderboard();
+    return;
+  }
+
+  if (gameState === 'enterInitials') {
+    ctx.save();
+    ctx.shadowColor = '#ff0';
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = '#ff0';
+    ctx.font = '24px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('NEW HIGH SCORE!', W / 2, H / 2 - 80);
+    ctx.shadowBlur = 0;
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '20px Courier New';
+    ctx.fillText('SCORE: ' + score, W / 2, H / 2 - 45);
+
+    ctx.fillStyle = '#0ff';
+    ctx.font = '16px Courier New';
+    ctx.fillText('ENTER YOUR INITIALS', W / 2, H / 2 - 10);
+
+    const boxW = 36, boxH = 44, gap = 12;
+    const totalW = boxW * 3 + gap * 2;
+    const startX = W / 2 - totalW / 2;
+    const boxY = H / 2 + 15;
+    for (let i = 0; i < 3; i++) {
+      const bx = startX + i * (boxW + gap);
+      ctx.strokeStyle = i === initials.length ? '#ff0' : '#888';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx, boxY, boxW, boxH);
+      if (i < initials.length) {
+        ctx.fillStyle = '#fff';
+        ctx.font = '28px Courier New';
+        ctx.textAlign = 'center';
+        ctx.fillText(initials[i], bx + boxW / 2, boxY + 33);
+      } else if (i === initials.length) {
+        const blink = Math.floor(frameCount / 20) % 2;
+        if (blink) {
+          ctx.fillStyle = '#ff0';
+          ctx.fillRect(bx + boxW / 2 - 8, boxY + boxH - 6, 16, 2);
+        }
+      }
+    }
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = '12px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('PRESS ENTER WHEN DONE', W / 2, H / 2 + 90);
+    ctx.restore();
+    return;
+  }
+
+  // HUD (with glow)
+  ctx.save();
+  ctx.shadowBlur = 6;
+  ctx.shadowColor = '#f44';
+  ctx.fillStyle = '#f00';
+  ctx.font = '12px Courier New';
+  ctx.textAlign = 'left';
+  ctx.fillText('1UP', 20, 16);
+  ctx.shadowColor = '#8af';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(score.toString().padStart(6, ' '), 20, 30);
+
+  ctx.shadowColor = '#f44';
+  ctx.fillStyle = '#f00';
+  ctx.textAlign = 'center';
+  ctx.fillText('HIGH SCORE', W / 2, 16);
+  ctx.shadowColor = '#8af';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(highScore.toString().padStart(6, ' '), W / 2, 30);
+  ctx.restore();
+
+  // Lives
+  for (let i = 0; i < lives - 1; i++) {
+    drawPlayer(30 + i * 28, H - 16);
+  }
+
+  // Stage indicator
+  ctx.fillStyle = '#ff0';
+  ctx.textAlign = 'right';
+  ctx.font = '12px Courier New';
+  for (let i = 0; i < Math.min(stage, 10); i++) {
+    ctx.fillText('\u2691', W - 20 - i * 16, H - 10);
+  }
+
+  // Bonus timer HUD
+  if (bonusActive && gameState === 'bonusPlaying') {
+    ctx.save();
+    ctx.fillStyle = '#ff0';
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 14px Courier New';
+    ctx.shadowColor = '#ff0';
+    ctx.shadowBlur = 6;
+    ctx.fillText('BONUS TIME: ' + Math.ceil(bonusTimeRemaining / 60), W / 2, 55);
+    ctx.restore();
+  }
+
+  if (gameState === 'stageIntro') {
+    ctx.save();
+    ctx.shadowColor = '#0ff';
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = '#0ff';
+    ctx.font = '20px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('STAGE ' + stage, W / 2, H / 2 - 20);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px Courier New';
+    if (stageTimer < 80) ctx.fillText('READY', W / 2, H / 2 + 20);
+    ctx.restore();
+    // Draw player during intro
+    drawPlayer(player.x, player.y);
+    return;
+  }
+
+  if (gameState === 'bonusIntro') {
+    ctx.save();
+    ctx.shadowColor = '#ff0';
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = '#ff0';
+    ctx.font = '20px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('BONUS STAGE', W / 2, H / 2 - 20);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px Courier New';
+    if (bonusTimer < 80) ctx.fillText('SHOOT THEM ALL!', W / 2, H / 2 + 20);
+    ctx.restore();
+    drawPlayer(player.x, player.y);
+    return;
+  }
+
+  if (gameState === 'bonusResults') {
+    ctx.save();
+    ctx.shadowColor = '#ff0';
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = '#ff0';
+    ctx.font = '20px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('BONUS RESULTS', W / 2, H / 2 - 40);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px Courier New';
+    ctx.fillText('HIT: ' + bonusChickensHit + ' / ' + bonusChickensTotal, W / 2, H / 2 + 10);
+    const bonusPts = bonusChickensHit * 100;
+    ctx.fillStyle = '#0f0';
+    ctx.fillText('BONUS: ' + bonusPts + ' PTS', W / 2, H / 2 + 40);
+    if (bonusChickensHit === bonusChickensTotal) {
+      ctx.fillStyle = '#f0f';
+      ctx.fillText('PERFECT!', W / 2, H / 2 + 70);
+    }
+    if (bonusTimer <= 0) {
+      const blink = Math.floor(frameCount / 30) % 2;
+      if (blink) {
+        ctx.fillStyle = '#0ff';
+        ctx.font = '14px Courier New';
+        ctx.fillText('PRESS SPACE', W / 2, H / 2 + 100);
+      }
+    }
+    ctx.restore();
+    return;
+  }
+
+  // Hawk (flies above formation)
+  if (hawk) {
+    drawHawk(hawk.x, hawk.y, frameCount, hawk.dir);
+  }
+
+  // Enemies
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    if (e.entering && e.enterDelay > 0) continue;
+    // Dive trails (afterimages behind diving chickens)
+    if (e.diving && e.trail && e.trail.length > 0) {
+      for (let t = e.trail.length - 1; t >= 0; t--) {
+        const tp = e.trail[t];
+        ctx.globalAlpha = 0.12 - t * 0.03;
+        if (e.type === 'bee') drawBee(tp.x, tp.y, animFrame);
+        else if (e.type === 'butterfly') drawButterfly(tp.x, tp.y, animFrame);
+        else if (e.type === 'boss') drawBoss(tp.x, tp.y, animFrame, e.hp);
+      }
+      ctx.globalAlpha = 1;
+    }
+    // Main sprite
+    if (e.type === 'bee') drawBee(e.x, e.y, animFrame);
+    else if (e.type === 'butterfly') drawButterfly(e.x, e.y, animFrame);
+    else if (e.type === 'boss') drawBoss(e.x, e.y, animFrame, e.hp);
+    // Hit flash overlay (white flash when damaged)
+    if (e.hitFlash > 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = `rgba(255,255,255,${e.hitFlash * 0.12})`;
+      ctx.beginPath();
+      const hr = e.type === 'boss' ? 16 : e.type === 'butterfly' ? 13 : 10;
+      ctx.arc(e.x, e.y, hr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  // Player
+  if (player.alive) {
+    drawPlayer(player.x, player.y);
+  }
+
+  // Player bullets (water drops - teardrop shape)
+  for (const b of playerBullets) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    // Trail glow
+    const trailG = ctx.createLinearGradient(0, -4, 0, 8);
+    trailG.addColorStop(0, 'rgba(100,200,255,0.5)');
+    trailG.addColorStop(1, 'rgba(100,200,255,0)');
+    ctx.fillStyle = trailG;
+    ctx.beginPath();
+    ctx.ellipse(0, 2, 2, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Drop body
+    const dg = ctx.createRadialGradient(-0.5, -1, 0, 0, 0, 3);
+    dg.addColorStop(0, '#bef'); dg.addColorStop(0.6, '#4cf'); dg.addColorStop(1, '#28a');
+    ctx.fillStyle = dg;
+    ctx.beginPath();
+    ctx.moveTo(0, -5);
+    ctx.quadraticCurveTo(3, -1, 2.5, 1);
+    ctx.arc(0, 1, 2.5, 0, Math.PI, false);
+    ctx.quadraticCurveTo(-3, -1, 0, -5);
+    ctx.fill();
+    // Specular highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath();
+    ctx.ellipse(-0.5, -1.5, 0.8, 1.2, -0.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Enemy bullets (eggs - oval with gradient)
+  for (const b of enemyBullets) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    // Rotate egg to face direction of travel
+    const angle = Math.atan2(b.vy, b.vx);
+    ctx.rotate(angle - Math.PI / 2);
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.beginPath();
+    ctx.ellipse(1, 1, 3.5, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Egg body
+    const eg = ctx.createRadialGradient(-1, -1.5, 0, 0, 0, 5);
+    eg.addColorStop(0, '#fff'); eg.addColorStop(0.5, '#fef0d0'); eg.addColorStop(1, '#e8d0a0');
+    ctx.fillStyle = eg;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 3, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.beginPath();
+    ctx.ellipse(-0.8, -2, 1, 2, -0.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Explosions
+  for (const ex of explosions) {
+    if (ex.hawkBlast) {
+      // Big hawk explosion — runs full 30 frames
+      drawHawkExplosion(ex.x, ex.y, ex.frame);
+      // Score popup (starts after initial flash, lasts longer, bigger text)
+      if (ex.frame > 4 && ex.frame < 28) {
+        const popAlpha = Math.max(0, 1 - (ex.frame - 4) / 24);
+        ctx.save();
+        ctx.shadowColor = '#f80';
+        ctx.shadowBlur = 10;
+        ctx.fillStyle = `rgba(255,200,50,${popAlpha})`;
+        ctx.font = 'bold 16px Courier New';
+        ctx.textAlign = 'center';
+        ctx.fillText('+' + ex.points, ex.x, ex.y - (ex.frame - 4) * 2);
+        ctx.restore();
+      }
+    } else if (ex.frame < 8) {
+      drawExplosion(ex.x, ex.y, ex.frame);
+    } else if (ex.points && ex.frame < 15) {
+      const popAlpha = Math.max(0, 1 - (ex.frame - 8) / 7);
+      ctx.save();
+      ctx.shadowColor = '#ff0';
+      ctx.shadowBlur = 6;
+      ctx.fillStyle = `rgba(255,255,0,${popAlpha})`;
+      ctx.font = 'bold 12px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText(ex.points.toString(), ex.x, ex.y - (ex.frame - 8) * 3);
+      ctx.restore();
+    }
+  }
+
+  // Hawk Feather Rain
+  for (const f of hawkFeathers) {
+    ctx.save();
+    ctx.translate(f.x, f.y);
+    ctx.rotate(f.rotation);
+    ctx.scale(f.size, f.size);
+    const fadeStart = f.maxLife - 60;
+    const alpha = f.life > fadeStart ? Math.max(0, 1 - (f.life - fadeStart) / 60) : 1;
+    let sc, fc;
+    if (f.color === 'brown') {
+      sc = `rgba(140,90,40,${alpha})`; fc = `rgba(160,110,50,${alpha * 0.4})`;
+    } else if (f.color === 'white') {
+      sc = `rgba(255,245,220,${alpha})`; fc = `rgba(255,255,240,${alpha * 0.4})`;
+    } else {
+      sc = `rgba(200,170,100,${alpha})`; fc = `rgba(220,190,120,${alpha * 0.4})`;
+    }
+    ctx.strokeStyle = sc;
+    ctx.fillStyle = fc;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(-6, 0);
+    ctx.quadraticCurveTo(0, -3, 6, 0);
+    ctx.quadraticCurveTo(0, 3, -6, 0);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-6, 0);
+    ctx.lineTo(6, 0);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Game Over
+  if (gameState === 'gameOver') {
+    ctx.save();
+    ctx.shadowColor = '#f00';
+    ctx.shadowBlur = 15;
+    ctx.fillStyle = '#f00';
+    ctx.font = '28px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W / 2, H / 2 - 30);
+    ctx.shadowBlur = 0;
+
+    if (gameOverTimer <= 0) {
+      ctx.fillStyle = '#fff';
+      ctx.font = '14px Courier New';
+      ctx.fillText('RESULTS', W / 2, H / 2 + 10);
+      const hitRate = shotsFired > 0 ? Math.round(shotsHit / shotsFired * 100) : 0;
+      ctx.fillText('SHOTS FIRED: ' + shotsFired, W / 2, H / 2 + 35);
+      ctx.fillText('HITS: ' + shotsHit, W / 2, H / 2 + 55);
+      ctx.fillText('HIT RATIO: ' + hitRate + '%', W / 2, H / 2 + 75);
+
+      const blink = Math.floor(frameCount / 30) % 2;
+      if (blink) {
+        ctx.shadowColor = '#0ff';
+        ctx.shadowBlur = 8;
+        ctx.fillStyle = '#0ff';
+        ctx.fillText('PRESS SPACE', W / 2, H / 2 + 110);
+      }
+    }
+    ctx.restore();
+  }
+
+
+  // Respawning blink
+  if (gameState === 'respawning' && respawnTimer < 60) {
+    if (Math.floor(respawnTimer / 8) % 2 === 0) {
+      drawPlayer(W / 2, player.y);
+    }
+  }
+
+  // Close screen shake transform
+  if (screenShake > 0.5) {
+    ctx.restore();
+  }
+}
+
+// ─── Leaderboard ────────────────────────────────────────────────────
+function drawLeaderboard() {
+  ctx.save();
+  ctx.shadowColor = '#ff0';
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = '#ff0';
+  ctx.font = '22px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillText('HIGH SCORES', W / 2, 100);
+  ctx.shadowBlur = 0;
+
+  ctx.font = '14px Courier New';
+  for (let i = 0; i < 10; i++) {
+    const y = 140 + i * 28;
+    const rank = (i + 1).toString().padStart(2, ' ') + '.';
+    if (i < leaderboard.length) {
+      const entry = leaderboard[i];
+      ctx.fillStyle = i === 0 ? '#ff0' : i < 3 ? '#f80' : '#fff';
+      ctx.textAlign = 'left';
+      ctx.fillText(rank, W / 2 - 120, y);
+      ctx.fillText(entry.name, W / 2 - 70, y);
+      ctx.textAlign = 'right';
+      ctx.fillText(entry.score.toString().padStart(8, ' '), W / 2 + 120, y);
+    } else {
+      ctx.fillStyle = '#555';
+      ctx.textAlign = 'left';
+      ctx.fillText(rank, W / 2 - 120, y);
+      ctx.fillText('---', W / 2 - 70, y);
+      ctx.textAlign = 'right';
+      ctx.fillText('0', W / 2 + 120, y);
+    }
+  }
+
+  if (gameOverTimer <= 0) {
+    const blink = Math.floor(frameCount / 30) % 2;
+    if (blink) {
+      ctx.shadowColor = '#0ff';
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = '#0ff';
+      ctx.font = '14px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText('PRESS SPACE', W / 2, 440);
+    }
+  }
+  ctx.restore();
+}
+
+// ─── Game Loop ───────────────────────────────────────────────────────
+function gameLoop() {
+  update();
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+</body>
+</html>
