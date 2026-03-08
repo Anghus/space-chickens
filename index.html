@@ -984,14 +984,14 @@ document.addEventListener('keydown', e => {
 });
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
-// ─── Touch Controls ─────────────────────────────────────────────────
-const touch = { left: false, right: false, fire: false, tap: false };
-// Button regions in canvas coordinates
-const touchBtns = {
-  left:  { x: 10, y: 565, w: 120, h: 60 },
-  right: { x: 140, y: 565, w: 120, h: 60 },
-  fire:  { x: 330, y: 565, w: 140, h: 60 }
-};
+// ─── Touch Controls (drag to move, tap to fire) ─────────────────────
+const touch = { dx: 0, fire: false, tap: false };
+let touchDragId = null;  // identifier of the finger doing the drag
+let touchLastX = 0;      // last x in canvas coords for drag delta
+
+// On-screen keyboard state for initials entry
+let touchKbRows = ['ABCDEFGHIJKLM', 'NOPQRSTUVWXYZ'];
+let touchKbBtns = []; // computed in drawTouchOverlay
 
 function canvasCoords(touchObj) {
   const rect = canvas.getBoundingClientRect();
@@ -1001,30 +1001,9 @@ function canvasCoords(touchObj) {
   };
 }
 
-function hitTest(cx, cy, btn) {
-  return cx >= btn.x && cx <= btn.x + btn.w && cy >= btn.y && cy <= btn.y + btn.h;
-}
-
-function processTouches(e) {
+canvas.addEventListener('touchstart', e => {
   e.preventDefault();
   if (audioCtx.state === 'suspended') audioCtx.resume();
-  touch.left = false; touch.right = false; touch.fire = false;
-  for (let i = 0; i < e.touches.length; i++) {
-    const c = canvasCoords(e.touches[i]);
-    if (hitTest(c.x, c.y, touchBtns.left)) touch.left = true;
-    else if (hitTest(c.x, c.y, touchBtns.right)) touch.right = true;
-    if (hitTest(c.x, c.y, touchBtns.fire)) touch.fire = true;
-  }
-}
-
-// On-screen keyboard state for initials entry
-let touchKbRows = ['ABCDEFGHIJKLM', 'NOPQRSTUVWXYZ'];
-let touchKbBtns = []; // computed once in draw
-
-function processTouchStart(e) {
-  e.preventDefault();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-  // Set tap flag for menu navigation
   touch.tap = true;
   // Handle on-screen keyboard for initials
   if (isTouchDevice && gameState === 'enterInitials') {
@@ -1049,26 +1028,49 @@ function processTouchStart(e) {
         }
       }
     }
+    return;
   }
-  processTouches(e);
-}
-
-canvas.addEventListener('touchstart', processTouchStart, { passive: false });
-canvas.addEventListener('touchmove', processTouches, { passive: false });
-canvas.addEventListener('touchend', e => {
-  e.preventDefault();
-  touch.left = false; touch.right = false; touch.fire = false;
-  // Re-check remaining touches
-  for (let i = 0; i < e.touches.length; i++) {
-    const c = canvasCoords(e.touches[i]);
-    if (hitTest(c.x, c.y, touchBtns.left)) touch.left = true;
-    else if (hitTest(c.x, c.y, touchBtns.right)) touch.right = true;
-    if (hitTest(c.x, c.y, touchBtns.fire)) touch.fire = true;
+  // First finger starts drag, additional taps = fire
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    if (touchDragId === null) {
+      touchDragId = t.identifier;
+      touchLastX = canvasCoords(t).x;
+    } else {
+      // Second finger tap = fire
+      touch.fire = true;
+    }
   }
 }, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    if (t.identifier === touchDragId) {
+      const cx = canvasCoords(t).x;
+      touch.dx = cx - touchLastX;
+      touchLastX = cx;
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    if (e.changedTouches[i].identifier === touchDragId) {
+      touchDragId = null;
+      touch.dx = 0;
+    }
+  }
+  touch.fire = false;
+}, { passive: false });
+
 canvas.addEventListener('touchcancel', e => {
   e.preventDefault();
-  touch.left = false; touch.right = false; touch.fire = false;
+  touchDragId = null;
+  touch.dx = 0;
+  touch.fire = false;
 }, { passive: false });
 
 // ─── Game State ──────────────────────────────────────────────────────
@@ -1637,8 +1639,9 @@ function update() {
 
   // ─ Player movement ─
   if (player.alive) {
-    if (keys['ArrowLeft'] || keys['KeyA'] || touch.left) player.x -= player.speed;
-    if (keys['ArrowRight'] || keys['KeyD'] || touch.right) player.x += player.speed;
+    if (keys['ArrowLeft'] || keys['KeyA']) player.x -= player.speed;
+    if (keys['ArrowRight'] || keys['KeyD']) player.x += player.speed;
+    if (touch.dx) player.x += touch.dx;
     player.x = Math.max(16, Math.min(W - 16, player.x));
 
     // Shooting
@@ -1957,6 +1960,7 @@ function killPlayer() {
   enemyBullets = [];
   // Clear touch tap flag at end of frame (one-shot per tap)
   touch.tap = false;
+  touch.dx = 0;
 }
 
 // ─── Touch Overlay Drawing ──────────────────────────────────────────
@@ -2008,35 +2012,7 @@ function drawTouchOverlay() {
     ctx.restore();
     return;
   }
-  // Draw control buttons
-  ctx.save();
-  for (const [name, btn] of Object.entries(touchBtns)) {
-    const pressed = touch[name];
-    ctx.fillStyle = pressed ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.10)';
-    ctx.beginPath();
-    const r = 10;
-    ctx.moveTo(btn.x + r, btn.y);
-    ctx.lineTo(btn.x + btn.w - r, btn.y);
-    ctx.quadraticCurveTo(btn.x + btn.w, btn.y, btn.x + btn.w, btn.y + r);
-    ctx.lineTo(btn.x + btn.w, btn.y + btn.h - r);
-    ctx.quadraticCurveTo(btn.x + btn.w, btn.y + btn.h, btn.x + btn.w - r, btn.y + btn.h);
-    ctx.lineTo(btn.x + r, btn.y + btn.h);
-    ctx.quadraticCurveTo(btn.x, btn.y + btn.h, btn.x, btn.y + btn.h - r);
-    ctx.lineTo(btn.x, btn.y + r);
-    ctx.quadraticCurveTo(btn.x, btn.y, btn.x + r, btn.y);
-    ctx.fill();
-    ctx.strokeStyle = pressed ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.2)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    ctx.fillStyle = pressed ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.5)';
-    ctx.font = 'bold 24px Courier New';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    if (name === 'left') ctx.fillText('\u25C0', btn.x + btn.w / 2, btn.y + btn.h / 2);
-    else if (name === 'right') ctx.fillText('\u25B6', btn.x + btn.w / 2, btn.y + btn.h / 2);
-    else ctx.fillText('FIRE', btn.x + btn.w / 2, btn.y + btn.h / 2);
-  }
-  ctx.restore();
+  // No buttons to draw — drag to move, tap to fire
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────
@@ -2110,7 +2086,7 @@ function draw() {
 
     ctx.fillStyle = '#aaa';
     ctx.font = '12px Courier New';
-    ctx.fillText(isTouchDevice ? 'USE BUTTONS TO MOVE & FIRE' : 'ARROWS: Move   SPACE: Fire', W / 2, 570);
+    ctx.fillText(isTouchDevice ? 'DRAG: Move   TAP: Fire' : 'ARROWS: Move   SPACE: Fire', W / 2, 570);
 
     ctx.fillStyle = '#666';
     if (leaderboard.length > 0) {
