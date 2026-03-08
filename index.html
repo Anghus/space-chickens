@@ -1464,8 +1464,6 @@ let frameCount = 0;
 
 function update() {
   frameCount++;
-  // Clear touch tap flag (one-shot per tap)
-  touch.tap = false;
 
   // Animate stars with twinkle
   for (const s of stars) {
@@ -1957,6 +1955,8 @@ function killPlayer() {
     respawnTimer = 90;
   }
   enemyBullets = [];
+  // Clear touch tap flag at end of frame (one-shot per tap)
+  touch.tap = false;
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────
