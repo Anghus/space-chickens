@@ -1006,7 +1006,7 @@ let bonusChickensHit = 0;
 let bonusTimeRemaining = 0;
 
 // Donkey bray tracking
-let nextDonkeyAt = 10000;
+// (donkey bray now plays on game over)
 
 // Player
 const player = { x: W / 2, y: H - 60, speed: 4, alive: true, shootCooldown: 0 };
@@ -1238,16 +1238,12 @@ function addScore(pts) {
     bonusPending = true;
     nextBonusAt += 5000;
   }
-  if (score >= nextDonkeyAt) {
-    nextDonkeyAt += 10000;
-    playDonkeyBray();
-  }
 }
 
 // ─── Donkey Bray Sound ──────────────────────────────────────────────
 function playDonkeyBray() {
   if (samples.donkey) {
-    playSample('donkey', { rate: 1.0, volume: 2.5, duration: 4.0 });
+    playSample('donkey', { rate: 1.0, volume: 2.5 });
     return;
   }
   // ── Synthesized fallback ──
@@ -1408,7 +1404,6 @@ function update() {
       nextBonusAt = 5000;
       bonusPending = false;
       bonusActive = false;
-      nextDonkeyAt = 10000;
       playCrowSound();
     }
     return;
@@ -1863,7 +1858,8 @@ function killPlayer() {
   lives--;
   if (lives <= 0) {
     gameState = 'gameOver';
-    gameOverTimer = 60;
+    gameOverTimer = 540; // ~9 seconds for donkey bray to finish
+    playDonkeyBray();
   } else {
     gameState = 'respawning';
     respawnTimer = 90;
