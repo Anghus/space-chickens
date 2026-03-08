@@ -2467,10 +2467,7 @@ function drawLeaderboard() {
   // ─── Touch Controls Overlay ──────────────────────────────────────
   if (isTouchDevice && gameState !== 'enterInitials') {
     ctx.save();
-    const playing = (gameState === 'playing' || gameState === 'bonusPlaying');
-    // Draw control buttons during gameplay
-    if (playing) {
-      for (const [name, btn] of Object.entries(touchBtns)) {
+    for (const [name, btn] of Object.entries(touchBtns)) {
         const pressed = touch[name];
         ctx.fillStyle = pressed ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.10)';
         ctx.beginPath();
@@ -2495,7 +2492,6 @@ function drawLeaderboard() {
         if (name === 'left') ctx.fillText('\u25C0', btn.x + btn.w / 2, btn.y + btn.h / 2);
         else if (name === 'right') ctx.fillText('\u25B6', btn.x + btn.w / 2, btn.y + btn.h / 2);
         else ctx.fillText('FIRE', btn.x + btn.w / 2, btn.y + btn.h / 2);
-      }
     }
     ctx.restore();
   }
