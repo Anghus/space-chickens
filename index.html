@@ -1959,6 +1959,86 @@ function killPlayer() {
   touch.tap = false;
 }
 
+// ─── Touch Overlay Drawing ──────────────────────────────────────────
+function drawTouchOverlay() {
+  if (!isTouchDevice) return;
+  if (gameState === 'enterInitials') {
+    // Draw on-screen keyboard
+    ctx.save();
+    touchKbBtns = [];
+    const kbStartY = H / 2 + 110;
+    const btnW = 30, btnH = 34, gap = 4;
+    for (let row = 0; row < touchKbRows.length; row++) {
+      const letters = touchKbRows[row];
+      const rowW = letters.length * (btnW + gap) - gap;
+      const startX = (W - rowW) / 2;
+      for (let col = 0; col < letters.length; col++) {
+        const bx = startX + col * (btnW + gap);
+        const by = kbStartY + row * (btnH + gap);
+        const key = letters[col];
+        touchKbBtns.push({ x: bx, y: by, w: btnW, h: btnH, key: key });
+        ctx.fillStyle = 'rgba(100,100,255,0.3)';
+        ctx.fillRect(bx, by, btnW, btnH);
+        ctx.strokeStyle = 'rgba(150,150,255,0.6)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(bx, by, btnW, btnH);
+        ctx.fillStyle = '#fff';
+        ctx.font = '16px Courier New';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(key, bx + btnW / 2, by + btnH / 2);
+      }
+    }
+    const actionY = kbStartY + 2 * (btnH + gap) + 4;
+    const delBtn = { x: W / 2 - 90, y: actionY, w: 70, h: 36, key: 'DEL' };
+    const okBtn = { x: W / 2 + 20, y: actionY, w: 70, h: 36, key: 'OK' };
+    touchKbBtns.push(delBtn, okBtn);
+    for (const btn of [delBtn, okBtn]) {
+      ctx.fillStyle = btn.key === 'OK' ? 'rgba(0,200,100,0.3)' : 'rgba(200,100,0,0.3)';
+      ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+      ctx.strokeStyle = btn.key === 'OK' ? 'rgba(0,255,150,0.6)' : 'rgba(255,150,0,0.6)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 16px Courier New';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(btn.key, btn.x + btn.w / 2, btn.y + btn.h / 2);
+    }
+    ctx.restore();
+    return;
+  }
+  // Draw control buttons
+  ctx.save();
+  for (const [name, btn] of Object.entries(touchBtns)) {
+    const pressed = touch[name];
+    ctx.fillStyle = pressed ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.10)';
+    ctx.beginPath();
+    const r = 10;
+    ctx.moveTo(btn.x + r, btn.y);
+    ctx.lineTo(btn.x + btn.w - r, btn.y);
+    ctx.quadraticCurveTo(btn.x + btn.w, btn.y, btn.x + btn.w, btn.y + r);
+    ctx.lineTo(btn.x + btn.w, btn.y + btn.h - r);
+    ctx.quadraticCurveTo(btn.x + btn.w, btn.y + btn.h, btn.x + btn.w - r, btn.y + btn.h);
+    ctx.lineTo(btn.x + r, btn.y + btn.h);
+    ctx.quadraticCurveTo(btn.x, btn.y + btn.h, btn.x, btn.y + btn.h - r);
+    ctx.lineTo(btn.x, btn.y + r);
+    ctx.quadraticCurveTo(btn.x, btn.y, btn.x + r, btn.y);
+    ctx.fill();
+    ctx.strokeStyle = pressed ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = pressed ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.5)';
+    ctx.font = 'bold 24px Courier New';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    if (name === 'left') ctx.fillText('\u25C0', btn.x + btn.w / 2, btn.y + btn.h / 2);
+    else if (name === 'right') ctx.fillText('\u25B6', btn.x + btn.w / 2, btn.y + btn.h / 2);
+    else ctx.fillText('FIRE', btn.x + btn.w / 2, btn.y + btn.h / 2);
+  }
+  ctx.restore();
+}
+
 // ─── Rendering ───────────────────────────────────────────────────────
 function draw() {
   ctx.fillStyle = '#000';
@@ -2044,11 +2124,13 @@ function draw() {
     for (let sy = 0; sy < H; sy += 3) {
       ctx.fillRect(0, sy, W, 1);
     }
+    drawTouchOverlay();
     return;
   }
 
   if (gameState === 'showLeaderboard') {
     drawLeaderboard();
+    drawTouchOverlay();
     return;
   }
 
@@ -2098,6 +2180,7 @@ function draw() {
     ctx.textAlign = 'center';
     ctx.fillText(isTouchDevice ? 'TAP OK WHEN DONE' : 'PRESS ENTER WHEN DONE', W / 2, H / 2 + 90);
     ctx.restore();
+    drawTouchOverlay();
     return;
   }
 
@@ -2162,6 +2245,7 @@ function draw() {
     ctx.restore();
     // Draw player during intro
     drawPlayer(player.x, player.y);
+    drawTouchOverlay();
     return;
   }
 
@@ -2179,6 +2263,7 @@ function draw() {
     if (bonusTimer < 80) ctx.fillText('SHOOT THEM ALL!', W / 2, H / 2 + 20);
     ctx.restore();
     drawPlayer(player.x, player.y);
+    drawTouchOverlay();
     return;
   }
 
@@ -2210,6 +2295,7 @@ function draw() {
       }
     }
     ctx.restore();
+    drawTouchOverlay();
     return;
   }
 
@@ -2464,85 +2550,7 @@ function drawLeaderboard() {
       ctx.fillText(isTouchDevice ? 'TAP TO CONTINUE' : 'PRESS SPACE', W / 2, 440);
     }
   }
-  // ─── Touch Controls Overlay ──────────────────────────────────────
-  if (isTouchDevice && gameState !== 'enterInitials') {
-    ctx.save();
-    for (const [name, btn] of Object.entries(touchBtns)) {
-        const pressed = touch[name];
-        ctx.fillStyle = pressed ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.10)';
-        ctx.beginPath();
-        const r = 10;
-        ctx.moveTo(btn.x + r, btn.y);
-        ctx.lineTo(btn.x + btn.w - r, btn.y);
-        ctx.quadraticCurveTo(btn.x + btn.w, btn.y, btn.x + btn.w, btn.y + r);
-        ctx.lineTo(btn.x + btn.w, btn.y + btn.h - r);
-        ctx.quadraticCurveTo(btn.x + btn.w, btn.y + btn.h, btn.x + btn.w - r, btn.y + btn.h);
-        ctx.lineTo(btn.x + r, btn.y + btn.h);
-        ctx.quadraticCurveTo(btn.x, btn.y + btn.h, btn.x, btn.y + btn.h - r);
-        ctx.lineTo(btn.x, btn.y + r);
-        ctx.quadraticCurveTo(btn.x, btn.y, btn.x + r, btn.y);
-        ctx.fill();
-        ctx.strokeStyle = pressed ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.2)';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-        ctx.fillStyle = pressed ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.5)';
-        ctx.font = 'bold 24px Courier New';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        if (name === 'left') ctx.fillText('\u25C0', btn.x + btn.w / 2, btn.y + btn.h / 2);
-        else if (name === 'right') ctx.fillText('\u25B6', btn.x + btn.w / 2, btn.y + btn.h / 2);
-        else ctx.fillText('FIRE', btn.x + btn.w / 2, btn.y + btn.h / 2);
-    }
-    ctx.restore();
-  }
-
-  // ─── Touch On-Screen Keyboard (initials entry) ────────────────────
-  if (isTouchDevice && gameState === 'enterInitials') {
-    ctx.save();
-    touchKbBtns = [];
-    const kbStartY = H / 2 + 110;
-    const btnW = 30, btnH = 34, gap = 4;
-    for (let row = 0; row < touchKbRows.length; row++) {
-      const letters = touchKbRows[row];
-      const rowW = letters.length * (btnW + gap) - gap;
-      const startX = (W - rowW) / 2;
-      for (let col = 0; col < letters.length; col++) {
-        const bx = startX + col * (btnW + gap);
-        const by = kbStartY + row * (btnH + gap);
-        const key = letters[col];
-        touchKbBtns.push({ x: bx, y: by, w: btnW, h: btnH, key: key });
-        ctx.fillStyle = 'rgba(100,100,255,0.3)';
-        ctx.fillRect(bx, by, btnW, btnH);
-        ctx.strokeStyle = 'rgba(150,150,255,0.6)';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(bx, by, btnW, btnH);
-        ctx.fillStyle = '#fff';
-        ctx.font = '16px Courier New';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(key, bx + btnW / 2, by + btnH / 2);
-      }
-    }
-    // DEL and OK buttons
-    const actionY = kbStartY + 2 * (btnH + gap) + 4;
-    const delBtn = { x: W / 2 - 90, y: actionY, w: 70, h: 36, key: 'DEL' };
-    const okBtn = { x: W / 2 + 20, y: actionY, w: 70, h: 36, key: 'OK' };
-    touchKbBtns.push(delBtn, okBtn);
-    for (const btn of [delBtn, okBtn]) {
-      ctx.fillStyle = btn.key === 'OK' ? 'rgba(0,200,100,0.3)' : 'rgba(200,100,0,0.3)';
-      ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
-      ctx.strokeStyle = btn.key === 'OK' ? 'rgba(0,255,150,0.6)' : 'rgba(255,150,0,0.6)';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 16px Courier New';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(btn.key, btn.x + btn.w / 2, btn.y + btn.h / 2);
-    }
-    ctx.restore();
-  }
-
+  drawTouchOverlay();
   ctx.restore();
 }
 
