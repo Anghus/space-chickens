@@ -1106,6 +1106,7 @@ const player = { x: W / 2, y: H - 60, speed: 4, alive: true, shootCooldown: 0 };
 // Bullets
 let playerBullets = [];
 let enemyBullets = [];
+let yolkDrips = [];
 
 // Enemies
 let enemies = [];
@@ -1467,6 +1468,19 @@ let frameCount = 0;
 function update() {
   frameCount++;
 
+  // ─ Yolk drip physics (runs in all states so drips persist through death) ─
+  for (let i = yolkDrips.length - 1; i >= 0; i--) {
+    const d = yolkDrips[i];
+    d.life++;
+    d.vy += 0.15;
+    d.vx *= 0.95;
+    d.x += d.vx;
+    d.y += d.vy;
+    if (d.life > d.maxLife || d.y > H + 20) {
+      yolkDrips.splice(i, 1);
+    }
+  }
+
   // Animate stars with twinkle
   for (const s of stars) {
     s.y += s.speed;
@@ -1488,6 +1502,7 @@ function update() {
       player.alive = true;
       playerBullets = [];
       enemyBullets = [];
+      yolkDrips = [];
       explosions = [];
       hawkFeathers = [];
       hawk = null;
@@ -1532,6 +1547,7 @@ function update() {
       player.x = W / 2;
       playerBullets = [];
       enemyBullets = [];
+      yolkDrips = [];
       explosions = [];
       hawkFeathers = [];
       hawk = null;
@@ -1556,6 +1572,7 @@ function update() {
       gameState = 'bonusIntro';
       playerBullets = [];
       enemyBullets = [];
+      yolkDrips = [];
       explosions = [];
       hawkFeathers = [];
       hawk = null;
@@ -1573,6 +1590,7 @@ function update() {
       player.x = W / 2;
       playerBullets = [];
       enemyBullets = [];
+      yolkDrips = [];
       explosions = [];
       hawkFeathers = [];
       hawk = null;
@@ -1791,6 +1809,31 @@ function update() {
     for (let i = enemyBullets.length - 1; i >= 0; i--) {
       const b = enemyBullets[i];
       if (Math.abs(b.x - player.x) < 10 && Math.abs(b.y - player.y) < 10) {
+        // Spawn yolk splatter at impact
+        for (let yi = 0; yi < 10; yi++) {
+          const ang = Math.random() * Math.PI * 2;
+          const spd = 0.5 + Math.random() * 2;
+          yolkDrips.push({
+            x: b.x, y: b.y,
+            vx: Math.cos(ang) * spd,
+            vy: Math.sin(ang) * spd - 1,
+            size: 1.5 + Math.random() * 2.5,
+            color: 'yolk',
+            life: 0, maxLife: 40 + Math.floor(Math.random() * 20)
+          });
+        }
+        for (let wi = 0; wi < 5; wi++) {
+          const ang = Math.random() * Math.PI * 2;
+          const spd = 1 + Math.random() * 2.5;
+          yolkDrips.push({
+            x: b.x, y: b.y,
+            vx: Math.cos(ang) * spd,
+            vy: Math.sin(ang) * spd - 0.5,
+            size: 1 + Math.random() * 1.5,
+            color: 'white',
+            life: 0, maxLife: 30 + Math.floor(Math.random() * 15)
+          });
+        }
         enemyBullets.splice(i, 1);
         killPlayer();
         break;
@@ -1938,6 +1981,7 @@ function update() {
       bonusTimer = 90; // Brief delay before allowing skip
       playerBullets = [];
       enemyBullets = [];
+      yolkDrips = [];
       explosions = [];
     }
   }
@@ -1957,7 +2001,7 @@ function killPlayer() {
     gameState = 'respawning';
     respawnTimer = 90;
   }
-  enemyBullets = [];
+  enemyBullets = []; // keep yolkDrips alive so yolk visually drips after death
   // Clear touch tap flag at end of frame (one-shot per tap)
   touch.tap = false;
   touch.dx = 0;
@@ -2403,6 +2447,33 @@ function draw() {
       ctx.fillText(ex.points.toString(), ex.x, ex.y - (ex.frame - 8) * 3);
       ctx.restore();
     }
+  }
+
+  // Yolk drips
+  for (const d of yolkDrips) {
+    ctx.save();
+    const progress = d.life / d.maxLife;
+    const alpha = progress > 0.6 ? Math.max(0, 1 - (progress - 0.6) / 0.4) : 1;
+    const stretch = 1 + Math.min(d.vy * 0.15, 1.5); // elongate as it drips faster
+    ctx.translate(d.x, d.y);
+    ctx.scale(1, stretch);
+    if (d.color === 'yolk') {
+      ctx.fillStyle = `rgba(255,200,0,${alpha * 0.9})`;
+      ctx.beginPath();
+      ctx.arc(0, 0, d.size, 0, Math.PI * 2);
+      ctx.fill();
+      // Brighter center
+      ctx.fillStyle = `rgba(255,230,50,${alpha * 0.6})`;
+      ctx.beginPath();
+      ctx.arc(-0.3, -0.3, d.size * 0.5, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = `rgba(255,255,240,${alpha * 0.5})`;
+      ctx.beginPath();
+      ctx.arc(0, 0, d.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   // Hawk Feather Rain
